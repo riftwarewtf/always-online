@@ -49,6 +49,26 @@ want and they are gone from the menu.
 Recognising a text file goes by content type first and extension second, across
 about sixty of them — logs, configs, source, diffs, subtitles, csv.
 
+The rows are drawn with Discord's own sheet component, so they sit in the menu
+looking like everything else in it. Because a wrong prop on an internal
+component would take the whole long-press menu down, they render inside a class
+error boundary: if Discord's component ever throws, the boundary swaps in rows
+this plugin draws itself, remembers not to try the native ones again that
+session, and the Status tab says so. **Discord row style** in settings switches
+between the two by hand.
+
+### The arrow on text files
+
+A text attachment gets Discord's own chevron under the file card, the way the
+desktop client has one. Tap it and the first chunk of the file opens inline in
+the message, mono-spaced and scrollable, with a Copy button; tap again and it
+folds away. The arrow rotates, the body is cached per URL so folding it back and
+forth costs one request, and the same byte-range rule applies. Discord's own
+tap-to-open behaviour on the file itself is untouched.
+
+So both ways work on a file: **hold** the message for the Toolbox row, or
+**tap** the arrow for it inline.
+
 ### Three ways to reach the same actions
 
 Patching Discord's action sheet is the part most likely to break on a client
@@ -65,12 +85,28 @@ update, so none of it is the only path:
 
 **Silent typing** stops the typing indicator from ever being sent. Off by default.
 
-**Archive** keeps what you saw before it disappeared. Deletes and edits are read
-out of the store from a `before` hook on the dispatcher — the one moment the old
-body still exists — and kept in memory, searchable, filterable, copyable, 200
-entries by default. Nothing is sent anywhere and the list clears on restart.
-`MESSAGE_UPDATE` also fires when an embed resolves, which is not an edit, so
-entries are only made when the text actually changed.
+**Keep deleted messages** leaves them where they were sent, the way Vencord does
+on desktop: a red gutter, a tinted row and a `(deleted)` marker on the message
+itself. `MESSAGE_DELETE` is intercepted on the dispatcher and never reaches the
+stores, so Discord has no reason to drop the row; the message id is remembered
+and `RowManager.prototype.generate` marks the row when it is next built. The
+store is nudged once, on a timer rather than mid-dispatch, so the row redraws
+immediately. Bulk deletes — purges — are kept the same way.
+
+**Show text before an edit** appends the previous version under an edited
+message. Edits are always passed straight through to Discord; only the old text
+is kept.
+
+**Archive** is the searchable copy of all of that: deletes and edits read out of
+the store at the one moment the old body still exists, kept in memory, 200
+entries by default, filterable and copyable. Nothing is sent anywhere and the
+list clears on restart. `MESSAGE_UPDATE` also fires when an embed resolves,
+which is not an edit, so entries are only made when the text actually changed.
+
+Deleted messages are kept in chat by default, with a switch under
+**Features → Extras**. It is the most invasive patch in here — it is the one
+that stops an event reaching Discord's stores — so it is the first thing to turn
+off if the client starts behaving oddly.
 
 ### Where things render
 
@@ -82,18 +118,19 @@ and the others render `null`. With the viewer switched off, previews fall back t
 the clipboard, and the settings page hosts its own copy of the modal so the Grab
 tab still shows them.
 
-The rows draw themselves by default rather than using Discord's `FormRow`: a
-wrong prop on an internal component takes the whole long-press menu down, and
-these have no way to be tested against a real client from here. **Native row
-style** in settings switches to `FormRow` if you prefer the exact native look.
+Previews also fall back to the clipboard when there is nowhere to draw: a
+preview triggered with the viewer switched off copies the file instead of
+failing quietly.
 
 ### If the rows do not show up
 
 **Status** reports every lookup and every patch by name: whether settings are
 persistent, whether the sheet hook is armed, which injection strategy it used
-(`row list` or the `wrapped tree` fallback), and which modules resolved. The
-sheet line only fills in after the first long press, because that is when
-Discord loads the sheet module. Alongside DevTools, `[toolbox]` lines show up in
+(`row list` or the `wrapped tree` fallback), whether the rows are Discord's or
+ours, what the file arrow bound to, whether deletes are being kept, and which
+modules resolved. The sheet line only fills in after the first long press,
+because that is when Discord loads the sheet module. A missing `RowManager`
+means deletes cannot be marked in the chat — the Archive tab still keeps them. Alongside DevTools, `[toolbox]` lines show up in
 its Console tab, and `__toolbox.state()` works from its Eval tab.
 
 ```js
@@ -168,7 +205,7 @@ No dependencies, Node 18+ (or Bun):
 node build.mjs             # builds every plugin in plugins/ to its own folder
 node build.mjs Toolbox     # just one
 node test/devtools.mjs     # fake RN runtime: capture, eval, module search, all five tabs render
-node test/toolbox.mjs      # fake action sheet, dispatcher, CDN: rows, embed text, preview, archive
+node test/toolbox.mjs      # fake sheet, dispatcher, RowManager, CDN: rows, embeds, inline files, deletes
 ```
 
 `manifest.json` carries a `hash`, the sha256 of the bundle. Kettu only refetches plugin code when that hash changes, so the build recomputes it every time — commit the built folder or installs serve stale code.

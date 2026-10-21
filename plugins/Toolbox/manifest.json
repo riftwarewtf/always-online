@@ -1,7 +1,7 @@
 {
   "name": "Toolbox",
-  "description": "A configurable message toolkit: copy embed contents, read text attachments in-app, copy IDs, links, code blocks, sticker and emoji URLs, silent typing, and an archive of deletes and edits. Every feature has its own switch.",
-  "version": "1.0.0",
+  "description": "A configurable message toolkit: copy embed contents, expand text attachments inline with Discord's own arrow, copy IDs, links, code blocks, sticker and emoji URLs. Keeps deleted messages in the chat and the text from before an edit. Every feature has its own switch.",
+  "version": "1.1.0",
   "authors": [
     {
       "name": "Larpbase"

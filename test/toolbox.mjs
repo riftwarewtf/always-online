@@ -44,9 +44,20 @@ function resetHooks(values = {}) {
 
 const pendingCleanups = [];
 
+// Shaped like the real one: an ES5 constructor, so a plugin can inherit from it
+// with Component.call(this, props) the way every ES5 React class does.
+function Component(props) {
+  this.props = props;
+}
+Component.prototype.isReactComponent = {};
+Component.prototype.setState = function (next) {
+  this.state = { ...this.state, ...(typeof next === "function" ? next(this.state) : next) };
+};
+
 const React = {
   version: "18.2.0",
   Fragment: "Fragment",
+  Component,
   createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
   useState: (initial) => {
     const index = hookIndex++;
@@ -63,6 +74,7 @@ const React = {
 const ReactNative = {
   View: "View",
   Text: "Text",
+  Image: "Image",
   TextInput: "TextInput",
   ScrollView: "ScrollView",
   Switch: "Switch",
@@ -163,8 +175,12 @@ const plainMessage = {
 
 const stored = { chan: [plainMessage, message] };
 
+let storeChanges = 0;
 const MessageStore = {
   getName: () => "MessageStore",
+  emitChange: () => {
+    storeChanges++;
+  },
   getMessage: (channelId, id) => (stored[channelId] || []).find((m) => m.id === id) || null,
   getMessages: (channelId) => ({ toArray: () => stored[channelId] || [] })
 };
@@ -208,6 +224,19 @@ FormRowComponent.Icon = function Icon() {
   return null;
 };
 const FormRowModule = { FormRow: FormRowComponent };
+
+/** RowManager.generate is where a mobile message row is built. */
+class RowManager {
+  generate(data) {
+    return { type: 1, message: { ...data, content: [{ type: "text", content: data.content ?? "" }] } };
+  }
+}
+const pristineGenerate = RowManager.prototype.generate;
+
+function AttachmentComponent(props) {
+  return React.createElement("View", { file: props.attachment.filename });
+}
+const attachmentModule = { default: AttachmentComponent };
 
 class ErrorBoundary {
   constructor() {
@@ -281,7 +310,12 @@ const vendettaForPlugins = {
   metro: {
     findByProps: (...props) => propsCandidates.find((c) => props.every((p) => p in c)),
     findByStoreName: (name) => storesByName[name],
-    findByName: (name) => (name === "ErrorBoundary" ? ErrorBoundary : undefined),
+    findByName: (name, defaultExport = true) => {
+      if (name === "ErrorBoundary") return ErrorBoundary;
+      if (name === "RowManager") return defaultExport === false ? { default: RowManager } : RowManager;
+      if (name === "MessageAttachment") return defaultExport === false ? attachmentModule : AttachmentComponent;
+      return undefined;
+    },
     common: {
       React,
       ReactNative,
@@ -301,7 +335,10 @@ const vendettaForPlugins = {
   },
   ui: {
     toasts: { showToast: (text) => toasts.push(text) },
-    assets: { getAssetIDByName: (name) => (name === "ic_message_copy" ? 42 : undefined) }
+    assets: {
+      getAssetIDByName: (name) =>
+        name === "ic_message_copy" ? 42 : name === "ic_chevron_small_down" ? 99 : undefined
+    }
   }
 };
 
@@ -337,9 +374,13 @@ assert.equal(tb.state().persistent, true, "the injected storage must be the one 
 
 assert.notEqual(ErrorBoundary.prototype.render, pristineBoundaryRender, "the viewer host should be mounted");
 assert.equal(tb.state().overlay, "mounted");
-assert.equal(tb.state().flux, "watching", "deletes and edits are archived by default");
+assert.equal(tb.state().dispatch, "deletes kept in chat", "deleted messages are kept by default");
+assert.equal(tb.state().chat, "marking messages in chat", "and marked where they were sent");
+assert.equal(tb.state().rowStyle, "discord", "rows use Discord's own component by default");
+assert.equal(tb.state().files, "bound to MessageAttachment", "text attachments get the arrow");
 assert.equal(tb.state().typing, "off", "silent typing is off by default");
 assert.ok(tb.state().sheet.indexOf("armed") !== -1, "the action sheet hook should be armed");
+assert.notEqual(RowManager.prototype.generate, pristineGenerate, "RowManager should be patched");
 
 /* ------------------------------------------------------------------ *
  * long press: rows get injected into the sheet                        *
@@ -368,11 +409,20 @@ assert.equal(tb.state().strategy, "row list", "rows belong in the sheet's own ro
 assert.equal(sheetRows.length, 3, "our row block should be appended to Discord's rows");
 
 const rowBlock = sheetRows[2];
-resetHooks();
-const rows = rowBlock.type(rowBlock.props);
-const labels = textOf(rows);
 
-for (const expected of [
+function renderRows() {
+  resetHooks();
+  return rowBlock.type(rowBlock.props);
+}
+
+/** A row is Discord's component (label in props) or ours (label as text). */
+function rowLabels(tree) {
+  return walkAll(tree, (n) => typeof n.props?.onPress === "function").map(
+    (n) => n.props.label ?? textOf(n).split(" | ")[0]
+  );
+}
+
+const EXPECTED_ROWS = [
   "Copy embed content",
   "View embed content",
   "Preview file contents",
@@ -382,15 +432,45 @@ for (const expected of [
   "Copy IDs",
   "Copy message link",
   "Copy sticker / emoji URL"
-]) {
-  assert.ok(labels.includes(expected), `the sheet should offer "${expected}"`);
-}
-assert.ok(!labels.includes("Copy message JSON"), "a disabled feature must not render a row");
+];
+
+/* ---- by default the rows are Discord's own, behind an error boundary ---- */
+
+const guarded = renderRows();
+assert.equal(guarded.type.displayName, "ToolboxGuard", "native rows should be wrapped in a boundary");
+const nativeRows = guarded.children.flat(4).filter((n) => n && typeof n === "object");
+assert.ok(
+  nativeRows.every((n) => n.type === FormRowComponent),
+  "every row should be Discord's own row component"
+);
+assert.deepEqual(nativeRows.map((n) => n.props.label), EXPECTED_ROWS, "with our labels on it");
+assert.equal(nativeRows[0].props.leading.type, FormRowComponent.Icon, "and Discord's icon component");
+assert.equal(nativeRows[0].props.leading.props.source, 42, "pointing at a real asset id");
+assert.ok(
+  !nativeRows.some((n) => n.props.label === "Copy message JSON"),
+  "a disabled feature must not render a row"
+);
+
+/* ---- if Discord's component throws, the boundary swaps in ours ---- */
+
+const GuardClass = guarded.type;
+const guardInstance = new GuardClass(guarded.props);
+assert.equal(guardInstance.render(), guarded.props.children, "a healthy boundary renders the native rows");
+guardInstance.componentDidCatch(new Error("bad prop"));
+guardInstance.state = GuardClass.getDerivedStateFromError();
+assert.equal(guardInstance.render(), guarded.props.fallback, "a broken one renders our rows instead");
+assert.equal(globalThis.__toolbox.state().rowStyle, "drawn (native threw)", "and it is remembered");
+
+const rows = renderRows();
+assert.equal(rows.type, "View", "after that failure the rows are drawn directly");
+assert.deepEqual(rowLabels(rows), EXPECTED_ROWS, "with the same actions");
 
 /* ---- pressing a row ---- */
 
 function pressRow(tree, label) {
-  const hit = walkAll(tree, (n) => typeof n.props?.onPress === "function").find((n) => textOf(n).includes(label));
+  const hit = walkAll(tree, (n) => typeof n.props?.onPress === "function").find(
+    (n) => (n.props.label ?? textOf(n)).includes(label)
+  );
   assert.ok(hit, `row "${label}" should be pressable`);
   hit.props.onPress();
 }
@@ -511,24 +591,103 @@ crashing.state = { error: new Error("render blew up") };
 assert.deepEqual(crashing.render(), { type: "App", props: {}, children: [] }, "no overlay over a crash report");
 
 /* ------------------------------------------------------------------ *
- * archive of deletes and edits                                        *
+ * the arrow on a text attachment                                      *
  * ------------------------------------------------------------------ */
 
+const fetchesBefore = fetchCalls.length;
+resetHooks();
+const attachmentTree = attachmentModule.default({ attachment: message.attachments[0] });
+assert.equal(attachmentTree.type, "Fragment", "a text attachment should be wrapped, not replaced");
+assert.ok(
+  walk(attachmentTree, (n) => n.props?.file === "server.log"),
+  "Discord's own file card must still be in there"
+);
+
+const expanderElement = walk(attachmentTree, (n) => typeof n.type === "function" && n.props?.att);
+assert.ok(expanderElement, "and the expander appended under it");
+
+resetHooks();
+const collapsed = expanderElement.type(expanderElement.props);
+assert.ok(textOf(collapsed).includes("Preview contents"), "collapsed, it offers to open");
+const arrow = walk(collapsed, (n) => n.type === "Image");
+assert.ok(arrow, "the arrow should be Discord's own asset");
+assert.equal(arrow.props.source, 99);
+assert.deepEqual(arrow.props.style.transform, [{ rotate: "0deg" }], "pointing down while closed");
+
+// Tapping it reads the file, over a byte range like everything else here.
+walk(collapsed, (n) => typeof n.props?.onPress === "function").props.onPress();
+await flush();
+assert.equal(fetchCalls.length, fetchesBefore + 1, "opening it fetches the file");
+assert.equal(fetchCalls.at(-1).options.headers.Range, "bytes=0-199999");
+
+resetHooks({ 0: true, 1: "line one\nline two" });
+const expanded = expanderElement.type(expanderElement.props);
+const expandedText = textOf(expanded);
+assert.ok(expandedText.includes("line one"), "open, it shows the contents inline");
+assert.ok(expandedText.includes("Hide contents"), "and offers to close again");
+assert.deepEqual(
+  walk(expanded, (n) => n.type === "Image").props.style.transform,
+  [{ rotate: "180deg" }],
+  "with the arrow flipped, like desktop"
+);
+const expanderCopy = walkAll(expanded, (n) => typeof n.props?.onPress === "function").find((n) =>
+  textOf(n).includes("Copy")
+);
+expanderCopy.props.onPress();
+assert.equal(clipboardWrites.at(-1), "line one\nline two", "copying from the expander");
+
+// A .png gets nothing: there is nothing to read.
+resetHooks();
+assert.equal(
+  walk(attachmentModule.default({ attachment: message.attachments[1] }), (n) => n.props?.att),
+  null,
+  "an image attachment is left alone"
+);
+
+/* ------------------------------------------------------------------ *
+ * deletes stay in the chat, edits keep their old text                 *
+ * ------------------------------------------------------------------ */
+
+const changesBefore = storeChanges;
 FluxDispatcher.dispatch({ type: "MESSAGE_DELETE", channelId: "chan", id: message.id });
-assert.equal(tb.archive.length, 1, "a delete should be archived");
+
+assert.equal(dispatched.length, 0, "the delete must never reach the stores while it is being kept");
+assert.equal(tb.state().kept, 1, "the message is marked as deleted instead");
+await new Promise((r) => setTimeout(r, 10));
+assert.equal(storeChanges, changesBefore + 1, "and the store is nudged so the row redraws");
+
+assert.equal(tb.archive.length, 1, "it is archived too");
 assert.equal(tb.archive[0].kind, "delete");
 assert.ok(tb.archive[0].content.includes("look at this"), "with the body the store still had");
 assert.equal(tb.archive[0].author, "Larpbase");
 assert.deepEqual(tb.archive[0].attachments, ["server.log", "shot.png"]);
-assert.equal(dispatched.at(-1).type, "MESSAGE_DELETE", "and the dispatch must still reach Discord");
+
+// The row it generates is the deleted one, marked where it was sent.
+const manager = new RowManager();
+const deletedRow = manager.generate({ id: message.id, channel_id: "chan", content: "look at this" });
+assert.equal(deletedRow.backgroundHighlight.gutterColor, "#ed4245", "red gutter, like a logged message");
+assert.ok(
+  deletedRow.message.content.some((node) => String(node.content).includes("(deleted)")),
+  "and a (deleted) marker in the message itself"
+);
+
+const untouchedRow = manager.generate({ id: "9999", channel_id: "chan", content: "fine" });
+assert.equal(untouchedRow.backgroundHighlight, undefined, "an ordinary message is left alone");
 
 FluxDispatcher.dispatch({
   type: "MESSAGE_UPDATE",
   message: { id: plainMessage.id, channel_id: "chan", content: "edited text" }
 });
-assert.equal(tb.archive.length, 2, "an edit should be archived");
+assert.equal(dispatched.at(-1).type, "MESSAGE_UPDATE", "an edit is always passed through");
+assert.equal(tb.archive.length, 2, "and archived");
 assert.equal(tb.archive[0].before, "just text");
 assert.equal(tb.archive[0].after, "edited text");
+
+const editedRow = manager.generate({ id: plainMessage.id, channel_id: "chan", content: "edited text" });
+assert.ok(
+  editedRow.message.content.some((node) => String(node.content).includes("before edit: just text")),
+  "the previous version shows under the edited message"
+);
 
 FluxDispatcher.dispatch({
   type: "MESSAGE_UPDATE",
@@ -538,6 +697,7 @@ assert.equal(tb.archive.length, 2, "an embed-resolution update is not an edit");
 
 FluxDispatcher.dispatch({ type: "TYPING_START", channelId: "chan" });
 assert.equal(tb.archive.length, 2, "unrelated events are ignored");
+assert.equal(dispatched.at(-1).type, "TYPING_START", "and passed straight through");
 
 /* ------------------------------------------------------------------ *
  * slash commands                                                      *
@@ -618,7 +778,15 @@ assert.equal(typingCalls.length, 1, "typing is sent while the feature is off");
 
 plugin.onUnload();
 pluginStorage.silentTyping = true;
+pluginStorage.keepDeleted = false;
 plugin.onLoad();
+
+// With keeping switched off, a delete is only observed, never swallowed.
+FluxDispatcher.dispatch({ type: "MESSAGE_DELETE", channelId: "chan", id: plainMessage.id });
+assert.equal(dispatched.at(-1).type, "MESSAGE_DELETE", "the delete reaches the stores again");
+assert.equal(globalThis.__toolbox.state().dispatch, "watching", "and the hook says so");
+assert.equal(globalThis.__toolbox.state().kept, 0, "nothing is being held on screen");
+
 assert.notEqual(Typing.startTyping, pristineStartTyping, "enabling it should patch startTyping");
 Typing.startTyping("chan");
 assert.equal(typingCalls.length, 1, "and then swallow the call");
@@ -631,8 +799,13 @@ assert.equal(globalThis.__toolbox.state().typing, "typing suppressed");
 plugin.onUnload();
 assert.equal(Typing.startTyping, pristineStartTyping, "startTyping restored");
 assert.equal(ErrorBoundary.prototype.render, pristineBoundaryRender, "ErrorBoundary unpatched");
+assert.equal(RowManager.prototype.generate, pristineGenerate, "RowManager unpatched");
+assert.equal(attachmentModule.default, AttachmentComponent, "the attachment component is handed back");
 assert.equal(registeredCommands.length, 0, "commands unregistered");
 assert.equal(globalThis.__toolbox, undefined, "internals bridge removed");
+
+const afterUnload = new RowManager().generate({ id: message.id, channel_id: "chan", content: "look at this" });
+assert.equal(afterUnload.backgroundHighlight, undefined, "and nothing is marked any more");
 
 const unpatchedSheet = { default: () => React.createElement("View", null, [React.createElement("View", { label: "Reply" })]) };
 ActionSheet.openLazy(Promise.resolve(unpatchedSheet), "MessageLongPressActionSheet", { message });
@@ -646,5 +819,7 @@ assert.equal(
 
 pendingCleanups.forEach((fn) => fn());
 realLog(
-  `all toolbox smoke tests passed (${clipboardWrites.length} clipboard writes, ${fetchCalls.length} range request, 4 tabs, 2 commands)`
+  "all toolbox smoke tests passed " +
+    `(${clipboardWrites.length} clipboard writes, ${fetchCalls.length} range requests, native rows + fallback, ` +
+    "inline file arrow, in-chat delete marking, 4 tabs, 2 commands)"
 );

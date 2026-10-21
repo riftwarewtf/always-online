@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  /* Toolbox v1.0.0 - built 2026-10-21T21:25:13.435Z */
+  /* Toolbox v1.1.0 - built 2026-10-21T21:43:24.643Z */
   var __mod = { exports: {} };
   (function (module, exports) {
 /**
@@ -215,11 +215,14 @@ var DEFAULTS = {
   // behaviour
   embedUrls: true,
   previewLimit: 200000,
-  nativeRows: false,
+  nativeRows: true,
   rowsAtTop: false,
   sheetRows: true,
+  inlineFiles: true,
   commands: true,
   silentTyping: false,
+  keepDeleted: true,
+  inlineEdits: true,
   logDeletes: true,
   logEdits: true,
   archiveLimit: 200,
@@ -1041,44 +1044,80 @@ function archiveFrom(message, kind, extra) {
   pushArchive(entry);
 }
 
-function captureEvent(event) {
-  if (!event || !event.type) return;
+var deletedAt = {};
+var editedFrom = {};
+
+function keyFor(channelId, id) {
+  return String(channelId || "") + ":" + String(id || "");
+}
+
+/** Deferred: emitting a store change inside a dispatch upsets Flux. */
+function touchStore(store) {
+  setTimeout(function () {
+    try {
+      if (typeof store.emitChange === "function") store.emitChange();
+    } catch (e) {}
+  }, 0);
+}
+
+/**
+ * Returns true when the event must not reach the stores - the one case being a
+ * delete we are keeping on screen. Everything else is observed and passed on.
+ */
+function handleEvent(event) {
+  if (!event || !event.type) return false;
   var type = event.type;
-  if (type !== "MESSAGE_DELETE" && type !== "MESSAGE_DELETE_BULK" && type !== "MESSAGE_UPDATE") return;
+  if (type !== "MESSAGE_DELETE" && type !== "MESSAGE_DELETE_BULK" && type !== "MESSAGE_UPDATE") return false;
 
   var store = MessageStore();
-  if (!store || typeof store.getMessage !== "function") return;
+  if (!store || typeof store.getMessage !== "function") return false;
 
   if (type === "MESSAGE_DELETE") {
-    if (!storage.logDeletes) return;
     var channelId = event.channelId || event.channel_id;
-    // Read before the stores do, which is the only moment the body still exists.
+    // Read before the stores do: this is the only moment the body still exists.
     var gone = store.getMessage(channelId, event.id);
-    if (gone) archiveFrom(gone, "delete");
-    return;
+    if (!gone) return false;
+    if (storage.logDeletes) archiveFrom(gone, "delete");
+    if (storage.keepDeleted) {
+      deletedAt[keyFor(channelId, event.id)] = Date.now();
+      touchStore(store);
+      return true;
+    }
+    return false;
   }
 
   if (type === "MESSAGE_DELETE_BULK") {
-    if (!storage.logDeletes) return;
     var ids = event.ids || [];
     var bulkChannel = event.channelId || event.channel_id;
-    for (var i = 0; i < ids.length && i < 50; i++) {
+    var kept = 0;
+    for (var i = 0; i < ids.length && i < 100; i++) {
       var one = store.getMessage(bulkChannel, ids[i]);
-      if (one) archiveFrom(one, "delete");
+      if (!one) continue;
+      if (storage.logDeletes) archiveFrom(one, "delete");
+      if (storage.keepDeleted) {
+        deletedAt[keyFor(bulkChannel, ids[i])] = Date.now();
+        kept++;
+      }
     }
-    return;
+    if (storage.keepDeleted && kept) {
+      touchStore(store);
+      return true;
+    }
+    return false;
   }
 
-  if (!storage.logEdits) return;
   var next = event.message;
-  if (!next || !next.id) return;
-  var previous = store.getMessage(next.channel_id || next.channelId, next.id);
-  if (!previous) return;
+  if (!next || !next.id) return false;
+  var editChannel = next.channel_id || next.channelId;
+  var previous = store.getMessage(editChannel, next.id);
+  if (!previous) return false;
   var before = previous.content || "";
   var after = next.content;
   // MESSAGE_UPDATE also fires for embed resolution, which is not an edit.
-  if (typeof after !== "string" || after === before) return;
-  archiveFrom(previous, "edit", { before: before, after: after, content: after });
+  if (typeof after !== "string" || after === before) return false;
+  if (storage.logEdits) archiveFrom(previous, "edit", { before: before, after: after, content: after });
+  if (storage.inlineEdits) editedFrom[keyFor(editChannel, next.id)] = before;
+  return false;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1094,8 +1133,18 @@ var sheetRetries = 0;
 var typingUnpatch = null;
 var typingState = "off";
 
-var fluxUnpatch = null;
-var fluxState = "off";
+var dispatchUnpatch = null;
+var dispatchState = "off";
+
+var rowUnpatch = null;
+var rowState = "off";
+var rowRetryTimer = null;
+var rowRetries = 0;
+
+var attachUnpatch = null;
+var attachState = "off";
+var attachRetryTimer = null;
+var attachRetries = 0;
 
 var commandHandles = [];
 var commandState = "off";
@@ -1316,44 +1365,252 @@ function unpatchTyping() {
   typingState = "off";
 }
 
-function patchFlux() {
-  if (fluxUnpatch) return;
-  if (!storage.logDeletes && !storage.logEdits) {
-    fluxState = "off";
+function patchDispatch() {
+  if (dispatchUnpatch) return;
+  if (!storage.logDeletes && !storage.logEdits && !storage.keepDeleted && !storage.inlineEdits) {
+    dispatchState = "off";
     return;
   }
   var patcher = getPatcher();
-  if (!patcher || typeof patcher.before !== "function") {
-    fluxState = "no patcher api";
+  if (!patcher || typeof patcher.instead !== "function") {
+    dispatchState = "no patcher api";
     return;
   }
   var dispatcher = FluxDispatcher();
   if (!dispatcher) {
     cache.FluxDispatcher = undefined;
-    fluxState = "dispatcher not found";
+    dispatchState = "dispatcher not found";
     return;
   }
   try {
-    // before(), not subscribe(): the stores have to still hold the old message.
-    fluxUnpatch = patcher.before("dispatch", dispatcher, function (args) {
+    // instead(), not before(): keeping a deleted message on screen means the
+    // delete never reaches the stores at all. Everything else is passed through
+    // untouched, including every event this plugin does not care about.
+    dispatchUnpatch = patcher.instead("dispatch", dispatcher, function (args, original) {
+      var swallow = false;
       try {
-        captureEvent(args[0]);
+        swallow = handleEvent(args[0]);
       } catch (e) {}
+      if (swallow) return undefined;
+      return original.apply(this, args);
     });
-    fluxState = "watching";
+    dispatchState = storage.keepDeleted ? "deletes kept in chat" : "watching";
   } catch (e) {
-    fluxState = "patch failed: " + ((e && e.message) || "unknown");
+    dispatchState = "patch failed: " + ((e && e.message) || "unknown");
   }
 }
 
-function unpatchFlux() {
-  if (fluxUnpatch) {
+function unpatchDispatch() {
+  if (dispatchUnpatch) {
     try {
-      fluxUnpatch();
+      dispatchUnpatch();
     } catch (e) {}
-    fluxUnpatch = null;
+    dispatchUnpatch = null;
   }
-  fluxState = "off";
+  dispatchState = "off";
+}
+
+/* ---- marking messages in the chat itself ---- */
+
+function appendNode(message, text) {
+  // Mobile content is an array of AST nodes; raw records still carry a string.
+  if (Array.isArray(message.content)) {
+    message.content.push({ type: "text", content: text });
+    return;
+  }
+  if (typeof message.content === "string") {
+    message.content = message.content + text;
+    return;
+  }
+  if (message.content === undefined || message.content === null) message.content = text;
+}
+
+function decorateRow(row) {
+  if (!row || !row.message || !row.message.id) return;
+  var message = row.message;
+  if (message.__toolbox) return;
+
+  var key = keyFor(message.channel_id || message.channelId, message.id);
+  var wasDeleted = !!deletedAt[key];
+  var previous = editedFrom[key];
+  if (!wasDeleted && !previous) return;
+
+  message.__toolbox = true;
+
+  if (wasDeleted) {
+    appendNode(message, "  (deleted)");
+    try {
+      row.backgroundHighlight = {
+        backgroundColor: "rgba(237,66,69,0.10)",
+        gutterColor: "#ed4245"
+      };
+    } catch (e) {}
+  }
+  if (previous && storage.inlineEdits) appendNode(message, "\nbefore edit: " + previous);
+}
+
+function resolveRowManager() {
+  var candidates = [];
+  try {
+    candidates.push(findByName("RowManager"));
+  } catch (e) {}
+  try {
+    candidates.push(findByName("RowManager", false));
+  } catch (e) {}
+  for (var i = 0; i < candidates.length; i++) {
+    var candidate = candidates[i];
+    if (!candidate) continue;
+    if (candidate.prototype && typeof candidate.prototype.generate === "function") return candidate;
+    if (candidate.default && candidate.default.prototype && typeof candidate.default.prototype.generate === "function") {
+      return candidate.default;
+    }
+  }
+  return null;
+}
+
+function patchRows() {
+  if (rowUnpatch) return;
+  if (!storage.keepDeleted && !storage.inlineEdits) {
+    rowState = "off";
+    return;
+  }
+  var patcher = getPatcher();
+  if (!patcher || typeof patcher.after !== "function") {
+    rowState = "no patcher api";
+    return;
+  }
+  var RowManager = resolveRowManager();
+  if (!RowManager) {
+    rowState = "waiting for RowManager (" + rowRetries + ")";
+    if (rowRetries < 15 && rowRetryTimer === null) {
+      rowRetryTimer = setTimeout(function () {
+        rowRetryTimer = null;
+        rowRetries++;
+        patchRows();
+      }, 2000);
+    }
+    return;
+  }
+  try {
+    rowUnpatch = patcher.after("generate", RowManager.prototype, function (args, row) {
+      try {
+        decorateRow(row);
+      } catch (e) {}
+    });
+    rowState = "marking messages in chat";
+  } catch (e) {
+    rowState = "patch failed: " + ((e && e.message) || "unknown");
+  }
+}
+
+function unpatchRows() {
+  if (rowRetryTimer !== null) {
+    clearTimeout(rowRetryTimer);
+    rowRetryTimer = null;
+  }
+  if (rowUnpatch) {
+    try {
+      rowUnpatch();
+    } catch (e) {}
+    rowUnpatch = null;
+  }
+  rowState = "off";
+}
+
+/* ---- the arrow on a text attachment ---- */
+
+var ATTACHMENT_CANDIDATES = [
+  "MessageAttachment",
+  "FileAttachment",
+  "MessageAttachmentFile",
+  "AttachmentCard",
+  "Attachment"
+];
+
+function resolveAttachmentModule() {
+  for (var i = 0; i < ATTACHMENT_CANDIDATES.length; i++) {
+    var mod;
+    try {
+      mod = findByName(ATTACHMENT_CANDIDATES[i], false);
+    } catch (e) {}
+    if (mod && typeof mod.default === "function") {
+      return { module: mod, name: ATTACHMENT_CANDIDATES[i] };
+    }
+  }
+  return null;
+}
+
+/** The attachment lands under a different prop name depending on the component. */
+function normaliseAttachment(props) {
+  if (!props || typeof props !== "object") return null;
+  var candidates = [props.attachment, props.item, props.file, props.source, props];
+  for (var i = 0; i < candidates.length; i++) {
+    var raw = candidates[i];
+    if (!raw || typeof raw !== "object") continue;
+    var filename = raw.filename || raw.name;
+    var url = raw.url || raw.proxy_url || raw.proxyUrl || raw.uri;
+    if (!filename || !url) continue;
+    return {
+      filename: filename,
+      url: url,
+      size: Number(raw.size) || 0,
+      contentType: raw.content_type || raw.contentType || ""
+    };
+  }
+  return null;
+}
+
+function patchAttachments() {
+  if (attachUnpatch || !storage.inlineFiles) return;
+  if (!h || !React) {
+    attachState = "no react";
+    return;
+  }
+  var patcher = getPatcher();
+  if (!patcher || typeof patcher.after !== "function") {
+    attachState = "no patcher api";
+    return;
+  }
+  var found = resolveAttachmentModule();
+  if (!found) {
+    attachState = "waiting for the attachment component (" + attachRetries + ")";
+    if (attachRetries < 15 && attachRetryTimer === null) {
+      attachRetryTimer = setTimeout(function () {
+        attachRetryTimer = null;
+        attachRetries++;
+        patchAttachments();
+      }, 2000);
+    }
+    return;
+  }
+  try {
+    attachUnpatch = patcher.after("default", found.module, function (args, tree) {
+      try {
+        var att = normaliseAttachment(args[0]);
+        if (!att || !isTextual(att)) return undefined;
+        return h(React.Fragment, null, tree, h(FileExpander, { att: att, key: "toolbox-expander" }));
+      } catch (e) {
+        return undefined;
+      }
+    });
+    attachState = "bound to " + found.name;
+  } catch (e) {
+    attachState = "patch failed: " + ((e && e.message) || "unknown");
+  }
+}
+
+function unpatchAttachments() {
+  if (attachRetryTimer !== null) {
+    clearTimeout(attachRetryTimer);
+    attachRetryTimer = null;
+  }
+  if (attachUnpatch) {
+    try {
+      attachUnpatch();
+    } catch (e) {}
+    attachUnpatch = null;
+  }
+  attachState = "off";
 }
 
 /* ------------------------------------------------------------------ *
@@ -1489,6 +1746,70 @@ function useScheme() {
  * ------------------------------------------------------------------ */
 
 /**
+ * A class error boundary, so Discord's own row component can be the default
+ * without risking the whole long-press menu: if it throws for any reason the
+ * boundary swaps in rows this plugin draws itself, and remembers not to try the
+ * native ones again this session.
+ */
+var nativeBroken = false;
+var Guard = null;
+(function () {
+  if (!React || !React.Component) return;
+
+  function Boundary(props) {
+    React.Component.call(this, props);
+    this.state = { failed: false };
+  }
+  Boundary.prototype = Object.create(React.Component.prototype);
+  Boundary.prototype.constructor = Boundary;
+  Boundary.displayName = "ToolboxGuard";
+  Boundary.getDerivedStateFromError = function () {
+    return { failed: true };
+  };
+  Boundary.prototype.componentDidCatch = function (error) {
+    nativeBroken = true;
+    log("Discord's row component threw, drawing our own instead", error);
+  };
+  Boundary.prototype.render = function () {
+    if (this.state.failed) return this.props.fallback || null;
+    return this.props.children;
+  };
+
+  Guard = Boundary;
+})();
+
+/** Discord's own sheet row, newest shape first. */
+function nativeRow() {
+  return lazy("nativeRow", function () {
+    var sheet = findByProps("ActionSheetRow");
+    if (sheet && sheet.ActionSheetRow) return { component: sheet.ActionSheetRow, iconProp: "icon" };
+    var form = FormRow();
+    if (form) return { component: form, iconProp: "leading" };
+    return null;
+  });
+}
+
+var CHEVRONS = ["ic_chevron_small_down", "ic_chevron_down_16px", "ic_chevron_down", "ic_arrow_down"];
+
+function chevron(color, open) {
+  var RN = ReactNative;
+  var id;
+  for (var i = 0; i < CHEVRONS.length && !id; i++) id = assetId(CHEVRONS[i]);
+  if (id && RN.Image) {
+    return h(RN.Image, {
+      source: id,
+      style: {
+        width: 16,
+        height: 16,
+        tintColor: color,
+        transform: [{ rotate: open ? "180deg" : "0deg" }]
+      }
+    });
+  }
+  return h(RN.Text, { style: { color: color, fontSize: 11 } }, open ? "\u25b2" : "\u25bc");
+}
+
+/**
  * Rendered inside Discord's sheet, so every failure is caught here: a throw in
  * this function would take the whole long-press menu down with it.
  */
@@ -1502,7 +1823,6 @@ function SheetRows(props) {
 
     var c = useScheme();
     var Touchable = RN.Pressable || RN.TouchableOpacity || RN.View;
-    var Native = storage.nativeRows ? FormRow() : null;
 
     function act(feature) {
       return function () {
@@ -1514,45 +1834,150 @@ function SheetRows(props) {
       };
     }
 
-    return h(
+    // Our own rows, sized and spaced like Discord's: also the fallback if theirs throws.
+    var drawn = h(
       RN.View,
-      { style: { paddingBottom: 6 } },
+      { style: { paddingBottom: 4 } },
       features.map(function (feature, index) {
-        if (Native) {
-          var icon = null;
-          try {
-            var id = assetId(feature.icon);
-            if (id && Native.Icon) icon = h(Native.Icon, { source: id });
-          } catch (e) {}
-          return h(Native, {
-            key: "tb" + index,
-            label: feature.label,
-            subLabel: feature.hint || undefined,
-            leading: icon || undefined,
-            onPress: act(feature)
-          });
-        }
         return h(
           Touchable,
           {
             key: "tb" + index,
             onPress: act(feature),
-            style: { paddingHorizontal: 16, paddingVertical: 12, flexDirection: "row", alignItems: "center" }
+            style: { minHeight: 48, paddingHorizontal: 16, justifyContent: "center" }
           },
-          h(
-            RN.View,
-            { style: { flex: 1 } },
-            h(RN.Text, { style: { color: c.text, fontSize: 16, fontWeight: "500" } }, feature.label),
-            feature.hint
-              ? h(RN.Text, { style: { color: c.dim, fontSize: 12, marginTop: 1 } }, feature.hint)
-              : null
-          ),
-          h(RN.Text, { style: { color: c.dim, fontSize: 12, fontWeight: "600" } }, "Toolbox")
+          h(RN.Text, { style: { color: c.text, fontSize: 16, fontWeight: "500" } }, feature.label),
+          feature.hint
+            ? h(RN.Text, { style: { color: c.dim, fontSize: 12, marginTop: 1 } }, feature.hint)
+            : null
         );
       })
     );
+
+    var native = storage.nativeRows !== false && !nativeBroken ? nativeRow() : null;
+    if (!native || !Guard) return drawn;
+
+    var Row = native.component;
+    var rows = features.map(function (feature, index) {
+      var rowProps = { key: "tbn" + index, label: feature.label, onPress: act(feature) };
+      if (feature.hint) rowProps.subLabel = feature.hint;
+      try {
+        var id = assetId(feature.icon);
+        if (id && Row.Icon) rowProps[native.iconProp] = h(Row.Icon, { source: id });
+      } catch (e) {}
+      return h(Row, rowProps);
+    });
+
+    return h(Guard, { fallback: drawn }, rows);
   } catch (e) {
     log("row render failed", e);
+    return null;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * inline file preview                                                 *
+ * ------------------------------------------------------------------ */
+
+var fileCache = {};
+
+/**
+ * The expander under a text attachment: Discord's chevron, and the file's first
+ * chunk inline when it is open - the desktop behaviour mobile never shipped.
+ */
+function FileExpander(props) {
+  try {
+    var RN = ReactNative;
+    if (!RN || !h) return null;
+    var att = props.att;
+    var c = useScheme();
+    var mono = RN.Platform && RN.Platform.OS === "ios" ? "Menlo" : "monospace";
+    var Touchable = RN.Pressable || RN.TouchableOpacity || RN.View;
+
+    var openState = React.useState(false);
+    var open = openState[0];
+    var setOpen = openState[1];
+
+    var bodyState = React.useState(null);
+    var body = bodyState[0];
+    var setBody = bodyState[1];
+
+    function toggle() {
+      var next = !open;
+      setOpen(next);
+      if (!next) return;
+      var cached = fileCache[att.url];
+      if (typeof cached === "string") {
+        setBody(cached);
+        return;
+      }
+      setBody(null);
+      fetchText(att.url, Number(storage.previewLimit) || DEFAULTS.previewLimit, function (err, text) {
+        var value = err
+          ? "Could not read this file: " + ((err && err.message) || "unknown")
+          : text || "(empty file)";
+        fileCache[att.url] = value;
+        setBody(value);
+      });
+    }
+
+    return h(
+      RN.View,
+      { style: { marginTop: 2, marginBottom: 6 } },
+      h(
+        Touchable,
+        {
+          onPress: toggle,
+          style: { flexDirection: "row", alignItems: "center", paddingVertical: 6, paddingRight: 8 }
+        },
+        chevron(c.dim, open),
+        h(
+          RN.Text,
+          { style: { color: c.dim, fontSize: 12, fontWeight: "600", marginLeft: 5 } },
+          open ? "Hide contents" : "Preview contents"
+        )
+      ),
+      open
+        ? h(
+            RN.View,
+            {
+              style: {
+                backgroundColor: c.field,
+                borderRadius: 8,
+                borderWidth: 1,
+                borderColor: c.border,
+                overflow: "hidden"
+              }
+            },
+            body === null
+              ? h(
+                  RN.Text,
+                  { style: { color: c.dim, fontSize: 12, padding: 14, textAlign: "center" } },
+                  "Reading\u2026"
+                )
+              : h(
+                  RN.ScrollView,
+                  { style: { maxHeight: 260 }, contentContainerStyle: { padding: 10 }, nestedScrollEnabled: true },
+                  h(
+                    RN.Text,
+                    { selectable: true, style: { color: c.text, fontSize: 11, fontFamily: mono, lineHeight: 16 } },
+                    body
+                  )
+                ),
+            h(
+              Touchable,
+              {
+                onPress: function () {
+                  if (typeof body === "string") copy(body, "Copied " + att.filename);
+                },
+                style: { borderTopWidth: 1, borderTopColor: c.border, paddingVertical: 8, alignItems: "center" }
+              },
+              h(RN.Text, { style: { color: c.dim, fontSize: 12, fontWeight: "600" } }, "Copy")
+            )
+          )
+        : null
+    );
+  } catch (e) {
     return null;
   }
 }
@@ -1856,17 +2281,20 @@ var TABS = ["Features", "Grab", "Archive", "Status"];
 
 var BEHAVIOUR = [
   { key: "sheetRows", label: "Long-press rows", hint: "Add the rows to Discord's message sheet" },
+  { key: "nativeRows", label: "Discord row style", hint: "Draw the rows with Discord's own sheet component" },
   { key: "rowsAtTop", label: "Rows at the top", hint: "Put them above Discord's own rows instead of below" },
-  { key: "nativeRows", label: "Native row style", hint: "Use Discord's FormRow - looks native, breaks more often" },
+  { key: "inlineFiles", label: "Arrow on text files", hint: "Expand a text attachment inside the message, like desktop" },
   { key: "embedUrls", label: "Include URLs in embeds", hint: "Link, image and thumbnail URLs in copied embeds" },
   { key: "overlay", label: "In-app viewer", hint: "Needed to show previews outside of settings" },
   { key: "toasts", label: "Confirmation toasts", hint: "Say so when something is copied" }
 ];
 
 var EXTRAS = [
+  { key: "keepDeleted", label: "Keep deleted messages", hint: "Leave them in the chat, marked, instead of letting them vanish" },
+  { key: "inlineEdits", label: "Show text before an edit", hint: "Append the previous version under an edited message" },
   { key: "silentTyping", label: "Silent typing", hint: "Never send the typing indicator" },
-  { key: "logDeletes", label: "Archive deleted messages", hint: "Keep what you saw before it vanished" },
-  { key: "logEdits", label: "Archive edits", hint: "Keep the text from before an edit" },
+  { key: "logDeletes", label: "Archive deleted messages", hint: "Also keep a searchable copy in the Archive tab" },
+  { key: "logEdits", label: "Archive edits", hint: "Also keep the old text in the Archive tab" },
   { key: "commands", label: "Slash commands", hint: "/embed and /preview act on the newest match" }
 ];
 
@@ -2420,6 +2848,9 @@ function SettingsPage() {
     var sheetDetail = sheetState + (sheetStrategy ? " · " + sheetStrategy : "");
     var modules = [
       ["ActionSheet", !!ActionSheetModule()],
+      ["Sheet row", !!nativeRow()],
+      ["RowManager", !!resolveRowManager()],
+      ["Attachment", !!resolveAttachmentModule()],
       ["MessageStore", !!MessageStore()],
       ["ChannelStore", !!ChannelStore()],
       ["SelectedChannel", !!SelectedChannelStore()],
@@ -2440,14 +2871,31 @@ function SettingsPage() {
         Divider(),
         InfoRow("Viewer", overlayMountState, overlayMountState === "mounted" ? c.good : c.dim),
         Divider(),
+        InfoRow(
+          "Row style",
+          nativeBroken ? "ours - Discord's threw" : storage.nativeRows !== false ? "Discord's own" : "ours",
+          nativeBroken ? c.warn : c.good
+        ),
+        Divider(),
+        InfoRow("File arrow", attachState, attachState.indexOf("bound") === 0 ? c.good : c.dim),
+        Divider(),
         InfoRow("Silent typing", typingState, typingState === "typing suppressed" ? c.good : c.dim),
         Divider(),
-        InfoRow("Archive", fluxState + " · " + archive.length + " kept", fluxState === "watching" ? c.good : c.dim),
+        InfoRow("Message events", dispatchState, dispatchState === "off" ? c.dim : c.good),
+        Divider(),
+        InfoRow(
+          "In-chat marking",
+          rowState + (Object.keys(deletedAt).length ? " · " + Object.keys(deletedAt).length + " kept" : ""),
+          rowState.indexOf("marking") === 0 ? c.good : rowState === "off" ? c.dim : c.warn
+        ),
+        Divider(),
+        InfoRow("Archive", archive.length + " entries", archive.length ? c.good : c.dim),
         Divider(),
         InfoRow("Commands", commandState, commandHandles.length ? c.good : c.dim)
       ]),
       Caption(
-        "The long-press rows only report their state after the first long press - that is when Discord loads the sheet module."
+        "The long-press rows only report their state after the first long press - that is when Discord loads the sheet module. " +
+          "Without RowManager, deleted messages cannot be marked in the chat, and the Archive tab keeps them instead."
       ),
       Heading("Modules"),
       Shell(
@@ -2483,8 +2931,14 @@ function SettingsPage() {
           Button("Re-apply patches", function () {
             unpatchSheet();
             unpatchOverlay();
+            unpatchRows();
+            unpatchAttachments();
+            nativeBroken = false;
+            cache = {};
             sheetRetries = 0;
             overlayRetries = 0;
+            rowRetries = 0;
+            attachRetries = 0;
             syncPatches();
             refresh();
             note("Patches re-applied");
@@ -2541,18 +2995,31 @@ function SettingsPage() {
  * lifecycle                                                          *
  * ------------------------------------------------------------------ */
 
-var VERSION = "1.0.0";
+var VERSION = "1.1.0";
 var running = false;
 
 function syncPatches() {
   if (storage.sheetRows) patchSheet();
   else unpatchSheet();
 
+  if (storage.inlineFiles) patchAttachments();
+  else unpatchAttachments();
+
   if (storage.silentTyping) patchTyping();
   else unpatchTyping();
 
-  if (storage.logDeletes || storage.logEdits) patchFlux();
-  else unpatchFlux();
+  // The dispatch hook changes shape with keepDeleted, so re-apply it when the
+  // mode it is running in no longer matches the setting.
+  if (storage.logDeletes || storage.logEdits || storage.keepDeleted || storage.inlineEdits) {
+    var wanted = storage.keepDeleted ? "deletes kept in chat" : "watching";
+    if (dispatchUnpatch && dispatchState !== wanted) unpatchDispatch();
+    patchDispatch();
+  } else {
+    unpatchDispatch();
+  }
+
+  if (storage.keepDeleted || storage.inlineEdits) patchRows();
+  else unpatchRows();
 
   if (storage.commands) registerCommands();
   else unregisterCommands();
@@ -2588,12 +3055,16 @@ function start() {
       return {
         sheet: sheetState,
         strategy: sheetStrategy,
+        rowStyle: nativeBroken ? "drawn (native threw)" : storage.nativeRows !== false ? "discord" : "drawn",
+        files: attachState,
         overlay: overlayMountState,
         typing: typingState,
-        flux: fluxState,
+        dispatch: dispatchState,
+        chat: rowState,
         commands: commandState,
         persistent: storageIsPersistent,
-        archived: archive.length
+        archived: archive.length,
+        kept: Object.keys(deletedAt).length
       };
     }
   };
@@ -2604,10 +3075,15 @@ function start() {
 function stop() {
   running = false;
   unpatchSheet();
+  unpatchAttachments();
   unpatchTyping();
-  unpatchFlux();
+  unpatchDispatch();
+  unpatchRows();
   unregisterCommands();
   unpatchOverlay();
+  deletedAt = {};
+  editedFrom = {};
+  fileCache = {};
   viewer = null;
   viewerListeners.length = 0;
   archive.length = 0;
