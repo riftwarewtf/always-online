@@ -19,7 +19,24 @@
  * ------------------------------------------------------------------ */
 
 var G = typeof globalThis !== "undefined" ? globalThis : window;
-var api = G.kettu || G.bunny || G.vendetta || {};
+
+/**
+ * Kettu evaluates a Vendetta-format plugin as `vendetta => { return <bundle> }`,
+ * and a Bunny-format one as `(bunny, definePlugin) => { <bundle> ... }`. So the
+ * per-plugin api object - the only one carrying real persistent storage - arrives
+ * as a function parameter in our enclosing scope, not as a global. The globals
+ * exist too but their `plugin` key does not, which is why this has to be checked
+ * by identifier and not by property lookup.
+ */
+var injected = null;
+try {
+  if (typeof vendetta !== "undefined" && vendetta) injected = vendetta;
+} catch (e) {}
+try {
+  if (!injected && typeof bunny !== "undefined" && bunny && bunny.plugin) injected = bunny;
+} catch (e) {}
+
+var api = injected || G.kettu || G.bunny || G.vendetta || {};
 
 function findByProps() {
   var props = Array.prototype.slice.call(arguments);
@@ -52,15 +69,37 @@ function findByStoreName(name) {
   return undefined;
 }
 
+function findByName(name, defaultExport) {
+  var m = api.metro;
+  if (!m) return undefined;
+  try {
+    if (typeof m.findByName === "function") return m.findByName(name, defaultExport);
+    var byName = m.filters && m.filters.byName;
+    if (byName) {
+      var filter = byName(name, defaultExport);
+      if (typeof m.findExports === "function") return m.findExports(filter);
+      if (typeof m.find === "function") return m.find(filter);
+    }
+  } catch (e) {}
+  return undefined;
+}
+
+function getPatcher() {
+  // Vendetta exposes patcher at the top level, Bunny nests it under api.
+  if (api.patcher && typeof api.patcher.after === "function") return api.patcher;
+  if (api.api && api.api.patcher && typeof api.api.patcher.after === "function") return api.api.patcher;
+  return null;
+}
+
 var common = (api.metro && api.metro.common) || {};
 var React = common.React || G.React || findByProps("createElement", "useState");
 var ReactNative = common.ReactNative || findByProps("ScrollView", "StyleSheet", "AppState");
 
-var storage =
-  (api.plugin && api.plugin.storage) ||
-  (api.plugins && api.plugins.storage) ||
-  api.storage ||
-  {};
+// The injected object's plugin.storage is an auto-persisting proxy backed by MMKV.
+// Without it we still run, but settings last only until the app restarts.
+var storage = (injected && injected.plugin && injected.plugin.storage) || null;
+var storageIsPersistent = !!storage;
+if (!storage) storage = {};
 
 function clipboard() {
   return common.clipboard || findByProps("setString", "getString");
@@ -92,7 +131,10 @@ var DEFAULTS = {
   captureErrors: true,
   maxEntries: 500,
   bodyLimit: 2000,
-  devtoolsHost: ""
+  devtoolsHost: "",
+  floatingButton: true,
+  bubbleX: null,
+  bubbleY: null
 };
 
 function applyDefaults() {
@@ -613,6 +655,7 @@ function start() {
   patchErrors();
   patchNetwork();
   patchWebSocket();
+  patchOverlay();
   running = true;
 
   // Reachable from the Eval tab and from other plugins: `__devtools.logs`, etc.
@@ -634,6 +677,7 @@ function start() {
 
 function stop() {
   if (!running) return;
+  unpatchOverlay();
   unpatchWebSocket();
   unpatchNetwork();
   unpatchErrors();
@@ -1422,6 +1466,8 @@ function SettingsPage() {
       }
     } catch (e) {}
 
+    add("Settings storage", storageIsPersistent ? "persistent" : "in-memory only");
+    add("Floating button", storage.floatingButton ? overlayMountState : "off");
     add("Captured logs", logs.length);
     add("Captured requests", requests.length);
 
@@ -1519,6 +1565,42 @@ function SettingsPage() {
       ]),
 
       Shell([
+        ToggleRow(
+          "Floating button",
+          "A draggable bubble that opens this panel from anywhere",
+          storage.floatingButton,
+          function (v) {
+            storage.floatingButton = v;
+            if (v) {
+              overlayRetries = 0;
+              patchOverlay();
+            } else {
+              unpatchOverlay();
+            }
+            overlayChanged();
+            refresh();
+          }
+        ),
+        Divider(),
+        h(
+          Touchable,
+          {
+            onPress: function () {
+              storage.bubbleX = null;
+              storage.bubbleY = null;
+              unpatchOverlay();
+              if (storage.floatingButton) {
+                overlayRetries = 0;
+                patchOverlay();
+              }
+              toast("Bubble position reset");
+              refresh();
+            },
+            style: { paddingHorizontal: 14, paddingVertical: 12 }
+          },
+          h(RN.Text, { style: { color: c.accent, fontSize: 14, fontWeight: "700" } }, "Reset bubble position")
+        ),
+        Divider(),
         ToggleRow("Capture console", "console.log / warn / error", storage.captureConsole, function (v) {
           storage.captureConsole = v;
           if (v) patchConsole();
@@ -1607,6 +1689,329 @@ function SettingsPage() {
     ),
     body
   );
+}
+
+/* ------------------------------------------------------------------ *
+ * floating button                                                     *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Discord's ErrorBoundary wraps the app, and Kettu itself patches its render to
+ * take the whole screen over, which makes it the one mount point we can count on
+ * for persistent UI. It can be instantiated more than once, so the overlay elects
+ * a single owner instance and every other one renders nothing.
+ */
+
+var overlayListeners = [];
+var overlayUnpatch = null;
+var overlayMountState = "not started";
+var overlayRetryTimer = null;
+var overlayRetries = 0;
+
+var hostSeq = 0;
+var hostsMounted = [];
+var hostOwner = null;
+
+function overlayChanged() {
+  for (var i = 0; i < overlayListeners.length; i++) {
+    try {
+      overlayListeners[i]();
+    } catch (e) {}
+  }
+}
+
+function subscribeOverlay(fn) {
+  overlayListeners.push(fn);
+  return function () {
+    var i = overlayListeners.indexOf(fn);
+    if (i !== -1) overlayListeners.splice(i, 1);
+  };
+}
+
+/** True for exactly one mounted host at a time. */
+function useIsOverlayOwner() {
+  var idRef = React.useRef(null);
+  if (idRef.current === null) idRef.current = ++hostSeq;
+  var id = idRef.current;
+
+  var state = React.useState(0);
+  var bump = state[1];
+
+  React.useEffect(function () {
+    return subscribeOverlay(function () {
+      bump(function (n) {
+        return n + 1;
+      });
+    });
+  }, []);
+
+  React.useEffect(function () {
+    hostsMounted.push(id);
+    if (hostOwner === null) {
+      hostOwner = id;
+      overlayChanged();
+    }
+    return function () {
+      var i = hostsMounted.indexOf(id);
+      if (i !== -1) hostsMounted.splice(i, 1);
+      if (hostOwner === id) {
+        hostOwner = hostsMounted.length ? hostsMounted[0] : null;
+        overlayChanged();
+      }
+    };
+  }, []);
+
+  return hostOwner === id;
+}
+
+function FloatingButton() {
+  var RN = ReactNative;
+  var isOwner = useIsOverlayOwner();
+
+  var openState = React.useState(false);
+  var open = openState[0];
+  var setOpen = openState[1];
+
+  var scheme = typeof RN.useColorScheme === "function" ? RN.useColorScheme() : "dark";
+  var dark = scheme !== "light";
+  var c = palette(dark);
+
+  var window_ = RN.Dimensions ? RN.Dimensions.get("window") : { width: 390, height: 844 };
+  var SIZE = 52;
+
+  var panRef = React.useRef(null);
+  if (panRef.current === null && RN.Animated) {
+    panRef.current = new RN.Animated.ValueXY({
+      x: typeof storage.bubbleX === "number" ? storage.bubbleX : window_.width - SIZE - 16,
+      y: typeof storage.bubbleY === "number" ? storage.bubbleY : window_.height * 0.35
+    });
+  }
+
+  var responderRef = React.useRef(null);
+  if (responderRef.current === null && RN.PanResponder && panRef.current) {
+    var pan = panRef.current;
+    responderRef.current = RN.PanResponder.create({
+      onStartShouldSetPanResponder: function () {
+        return true;
+      },
+      // Only steal the gesture once it is clearly a drag, so a tap still reads as a tap.
+      onMoveShouldSetPanResponder: function (e, gesture) {
+        return Math.abs(gesture.dx) > 4 || Math.abs(gesture.dy) > 4;
+      },
+      onPanResponderGrant: function () {
+        try {
+          pan.setOffset({ x: pan.x._value, y: pan.y._value });
+          pan.setValue({ x: 0, y: 0 });
+        } catch (e) {}
+      },
+      onPanResponderMove: function (e, gesture) {
+        pan.setValue({ x: gesture.dx, y: gesture.dy });
+      },
+      onPanResponderRelease: function (e, gesture) {
+        try {
+          pan.flattenOffset();
+        } catch (e2) {}
+
+        var tap = Math.abs(gesture.dx) < 5 && Math.abs(gesture.dy) < 5;
+        if (tap) {
+          setOpen(true);
+          return;
+        }
+
+        // Clamp into the screen and remember where it was left.
+        try {
+          var x = Math.min(Math.max(pan.x._value, 8), window_.width - SIZE - 8);
+          var y = Math.min(Math.max(pan.y._value, 48), window_.height - SIZE - 48);
+          pan.setValue({ x: x, y: y });
+          storage.bubbleX = x;
+          storage.bubbleY = y;
+        } catch (e3) {}
+      }
+    });
+  }
+
+  if (!isOwner || !storage.floatingButton) return null;
+  if (!panRef.current || !responderRef.current || !RN.Modal) return null;
+
+  var bubble = h(
+    RN.Animated.View,
+    Object.assign(
+      {
+        style: {
+          position: "absolute",
+          width: SIZE,
+          height: SIZE,
+          borderRadius: SIZE / 2,
+          backgroundColor: c.accent,
+          alignItems: "center",
+          justifyContent: "center",
+          shadowColor: "#000",
+          shadowOpacity: 0.35,
+          shadowRadius: 8,
+          shadowOffset: { width: 0, height: 3 },
+          elevation: 8,
+          transform: panRef.current.getTranslateTransform()
+        }
+      },
+      responderRef.current.panHandlers
+    ),
+    h(
+      RN.Text,
+      { style: { color: "#ffffff", fontSize: 15, fontWeight: "800" } },
+      "</>"
+    )
+  );
+
+  var panel = h(
+    RN.Modal,
+    {
+      visible: open,
+      transparent: true,
+      animationType: "slide",
+      statusBarTranslucent: true,
+      onRequestClose: function () {
+        setOpen(false);
+      }
+    },
+    h(
+      RN.View,
+      { style: { flex: 1, backgroundColor: "rgba(0,0,0,0.55)" } },
+      h(
+        RN.View,
+        {
+          style: {
+            flex: 1,
+            marginTop: 64,
+            backgroundColor: dark ? "#16171d" : "#ffffff",
+            borderTopLeftRadius: 18,
+            borderTopRightRadius: 18,
+            overflow: "hidden"
+          }
+        },
+        h(
+          RN.View,
+          {
+            style: {
+              flexDirection: "row",
+              alignItems: "center",
+              paddingHorizontal: 16,
+              paddingVertical: 14,
+              borderBottomWidth: 1,
+              borderBottomColor: c.border
+            }
+          },
+          h(
+            RN.Text,
+            { style: { color: c.text, fontSize: 17, fontWeight: "800", flex: 1 } },
+            "DevTools"
+          ),
+          h(
+            RN.Pressable || RN.TouchableOpacity || RN.View,
+            {
+              onPress: function () {
+                setOpen(false);
+              },
+              style: {
+                paddingHorizontal: 14,
+                paddingVertical: 6,
+                borderRadius: 999,
+                backgroundColor: c.chip
+              }
+            },
+            h(RN.Text, { style: { color: c.text, fontSize: 14, fontWeight: "700" } }, "Close")
+          )
+        ),
+        h(SettingsPage, null)
+      )
+    )
+  );
+
+  return h(
+    RN.View,
+    { pointerEvents: "box-none", style: RN.StyleSheet.absoluteFillObject },
+    bubble,
+    panel
+  );
+}
+
+function resolveErrorBoundary() {
+  var candidates = [];
+  try {
+    candidates.push(findByName("ErrorBoundary", false));
+  } catch (e) {}
+  try {
+    candidates.push(findByName("ErrorBoundary"));
+  } catch (e) {}
+
+  for (var i = 0; i < candidates.length; i++) {
+    var candidate = candidates[i];
+    if (!candidate) continue;
+    if (candidate.prototype && typeof candidate.prototype.render === "function") return candidate;
+    if (candidate.default && candidate.default.prototype && typeof candidate.default.prototype.render === "function") {
+      return candidate.default;
+    }
+  }
+  return null;
+}
+
+function patchOverlay() {
+  if (overlayUnpatch || !storage.floatingButton) return;
+  if (!h || !ReactNative || !React) {
+    overlayMountState = "no react";
+    return;
+  }
+
+  var patcher = getPatcher();
+  if (!patcher) {
+    overlayMountState = "no patcher api";
+    return;
+  }
+
+  var ErrorBoundary = resolveErrorBoundary();
+  if (!ErrorBoundary) {
+    // The module may not be initialized yet on a cold start; back off and retry.
+    overlayMountState = "waiting for ErrorBoundary (" + overlayRetries + ")";
+    if (overlayRetries < 15 && overlayRetryTimer === null) {
+      overlayRetryTimer = setTimeout(function () {
+        overlayRetryTimer = null;
+        overlayRetries++;
+        patchOverlay();
+      }, 2000);
+    }
+    return;
+  }
+
+  try {
+    overlayUnpatch = patcher.after("render", ErrorBoundary.prototype, function (args, ret) {
+      // Leave the error screen alone - a crash report is not the place for a bubble.
+      try {
+        if (this && this.state && this.state.error) return;
+      } catch (e) {}
+      return h(React.Fragment, null, ret, h(FloatingButton, null));
+    });
+    overlayMountState = "mounted";
+    pushLog("log", ["Floating button mounted on ErrorBoundary"], "devtools");
+  } catch (e) {
+    overlayMountState = "patch failed: " + (e && e.message);
+    pushLog("error", ["Floating button patch failed", e], "devtools");
+  }
+}
+
+function unpatchOverlay() {
+  if (overlayRetryTimer !== null) {
+    clearTimeout(overlayRetryTimer);
+    overlayRetryTimer = null;
+  }
+  if (overlayUnpatch) {
+    try {
+      overlayUnpatch();
+    } catch (e) {}
+    overlayUnpatch = null;
+  }
+  hostOwner = null;
+  hostsMounted.length = 0;
+  overlayMountState = "not started";
+  overlayChanged();
 }
 
 /* ------------------------------------------------------------------ *

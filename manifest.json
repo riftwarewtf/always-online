@@ -1,7 +1,7 @@
 {
   "name": "DevTools",
-  "description": "Web-inspector style debugging panel: console capture, eval REPL, network log, module explorer and a React DevTools bridge.",
-  "version": "1.0.0",
+  "description": "Web-inspector style debugging panel behind a floating button: console capture, eval REPL, network log, module explorer and a React DevTools bridge.",
+  "version": "1.1.0",
   "authors": [
     {
       "name": "Larpbase"

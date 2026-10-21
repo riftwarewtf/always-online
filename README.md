@@ -40,7 +40,15 @@ Object.keys($)
 
 **Modules** — search Metro's registry by exported prop name, see which module ids match, drill into any export to inspect its value. Only already-initialized modules are read: forcing a lazy one runs its side effects, which is a good way to break the app from inside a debugger.
 
-**Device** — build and engine info (Discord build, React, React Native, Hermes bytecode version, device, window metrics), the capture toggles, buffer size, and the React DevTools bridge.
+**Device** — build and engine info (Discord build, React, React Native, Hermes bytecode version, device, window metrics), the capture toggles, buffer size, the floating button controls, and the React DevTools bridge.
+
+### Floating button
+
+A draggable bubble that opens the panel from anywhere in the app — no walking back into Settings every time. Tap to open, drag to move (it remembers where you left it and clamps itself inside the screen), and it stands down on Discord's crash screen, because a debug bubble over a crash report helps nobody.
+
+It mounts by patching `ErrorBoundary.prototype.render` and wrapping the returned tree, which is the same mount point Kettu itself uses to take the screen over on a crash — the one component that is reliably above everything. Discord instantiates more than one boundary, so the overlay elects a single owner instance and every other one renders `null`; when the owner unmounts the next one claims it. On a cold start the module may not be initialized yet, so the patch retries every 2s up to 15 times, and the Device tab reports exactly where it got to (`mounted`, `waiting for ErrorBoundary (3)`, `no patcher api`).
+
+Turn it off in Device → Floating button if you want the panel to live in Settings only.
 
 ### React DevTools
 
@@ -88,9 +96,24 @@ node build.mjs --serve --watch --port=4040
 
 Then install `http://<your-lan-ip>:4040/` and it rebuilds on every save.
 
-### The build detail that matters
+### The loader contract
 
-Kettu evaluates a plugin's main file as `return <file contents>`. JavaScript's automatic semicolon insertion means a newline straight after `return` ends the statement — so a bundle that opens with a banner comment, or a blank line, silently loads as nothing at all. `DevTools/index.js` begins with `(` as its literal first character. `build.mjs` wraps the source in one IIFE expression with the banner inside, and hands it a CommonJS-shaped `module`, so the same file also works under a loader that wraps it as `new Function("module", "exports", code)`.
+From Kettu's own source (`src/core/vendetta/plugins.ts`), a Vendetta-format plugin is loaded like this:
+
+```js
+const pluginString = `vendetta=>{return ${plugin.js}}`;
+const raw = (0, eval)(pluginString)(vendettaForPlugins);
+const ret = typeof raw === "function" ? raw() : raw;
+return ret?.default ?? ret ?? {};
+```
+
+Two consequences, and both of them bite silently:
+
+**The bundle must be a single expression starting with `(`.** It lands straight after `return`, and JavaScript's automatic semicolon insertion means a newline there ends the statement — a bundle that opens with a banner comment or a blank line loads as nothing at all, with no error. `build.mjs` keeps the banner inside the IIFE for exactly this reason, and also hands the source a CommonJS-shaped `module` so the same file works under a loader that wraps it as `new Function("module", "exports", code)`.
+
+**The plugin API arrives as a function parameter, not a global.** `window.bunny` and `window.vendetta` do exist, but neither carries `plugin.storage` — that lives only on the per-plugin object passed in as `vendetta`. Reading the global instead gets you an in-memory object that looks like it works and silently forgets everything on restart. `src/index.js` therefore picks up the identifier from its enclosing scope with a `typeof` guard, and the Device tab reports `Settings storage: persistent` or `in-memory only` so the failure is never silent.
+
+`test/smoke.mjs` loads the built bundle through that exact wrapper, so breaking either contract fails the test instead of the phone.
 
 ## Layout
 
@@ -103,6 +126,6 @@ DevTools/          what Kettu installs - committed on purpose, this is what Page
 index.html         landing page listing the plugins and their install URLs
 ```
 
-`src/index.js` imports nothing. It reads its API off `globalThis.kettu ?? globalThis.bunny ?? globalThis.vendetta`, tries both the old `findByProps` and the newer `filters.byProps` + `findExports` shapes, and degrades to a message in the UI when a lookup misses rather than throwing. That is why there is no bundler here and why one file works across all three mods.
+`src/index.js` imports nothing. It takes the per-plugin API from its enclosing scope when there is one and falls back to the globals, tries both the old `findByProps` and the newer `filters.byProps` + `findExports` shapes, finds the patcher at `patcher` (Vendetta) or `api.patcher` (Bunny), and degrades to a message in the UI when a lookup misses rather than throwing. That is why there is no bundler here and why one file works across all three mods.
 
 Adding a second plugin means a second source file and a second output folder, each with its own manifest and install URL — the folders are independent.
