@@ -1,0 +1,17 @@
+{
+  "name": "Always Online",
+  "description": "Never report idle, afk or offline to the gateway, and drive a full custom rich presence.",
+  "version": "1.0.0",
+  "authors": [
+    {
+      "name": "Larpbase"
+    }
+  ],
+  "main": "index.js",
+  "vendetta": {
+    "icon": "ic_activity_24px"
+  },
+  "bunny": {
+    "icon": "ic_activity_24px"
+  }
+}
