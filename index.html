@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kettu Plugins</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --card: #16171d;
+        --border: #24262e;
+        --text: #f2f3f5;
+        --dim: #9aa0aa;
+        --accent: #5865f2;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 48px 16px;
+        background: #0b0c0f;
+        color: var(--text);
+        font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+        display: flex;
+        justify-content: center;
+      }
+      main { width: 100%; max-width: 640px; }
+      h1 { font-size: 28px; margin: 0 0 6px; letter-spacing: -0.02em; }
+      p.sub { color: var(--dim); margin: 0 0 32px; }
+      .plugin {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 20px;
+        margin-bottom: 16px;
+      }
+      .plugin h2 { font-size: 18px; margin: 0 0 4px; }
+      .plugin p { color: var(--dim); margin: 0 0 16px; font-size: 14px; }
+      .url {
+        display: flex;
+        gap: 8px;
+        align-items: stretch;
+      }
+      code {
+        flex: 1;
+        background: #0b0c0f;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 10px 12px;
+        font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: var(--text);
+        overflow-x: auto;
+        white-space: nowrap;
+      }
+      button {
+        background: var(--accent);
+        color: #fff;
+        border: 0;
+        border-radius: 8px;
+        padding: 0 16px;
+        font: 600 14px/1 inherit;
+        cursor: pointer;
+      }
+      button:active { opacity: 0.8; }
+      footer { color: var(--dim); font-size: 13px; margin-top: 32px; }
+      a { color: var(--accent); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Kettu Plugins</h1>
+      <p class="sub">Paste a folder URL into Kettu &rarr; Settings &rarr; Plugins &rarr; +</p>
+
+      <div class="plugin">
+        <h2>DevTools</h2>
+        <p>
+          Web-inspector style debugging panel: console capture, an eval REPL, a network log,
+          a module explorer and a React DevTools bridge.
+        </p>
+        <div class="url">
+          <code id="devtools-url"></code>
+          <button type="button" data-copy="devtools-url">Copy</button>
+        </div>
+      </div>
+
+      <footer>
+        Source on <a href="https://github.com/riftwarewtf/always-online">GitHub</a>.
+      </footer>
+    </main>
+
+    <script>
+      // Works whether this is served from Pages or opened from a local build.
+      const base = location.origin + location.pathname.replace(/index\.html$/, "");
+      document.getElementById("devtools-url").textContent = base + "DevTools/";
+
+      document.querySelectorAll("button[data-copy]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const text = document.getElementById(button.dataset.copy).textContent;
+          try {
+            await navigator.clipboard.writeText(text);
+            button.textContent = "Copied";
+            setTimeout(() => (button.textContent = "Copy"), 1200);
+          } catch {
+            button.textContent = "Copy failed";
+            setTimeout(() => (button.textContent = "Copy"), 1200);
+          }
+        });
+      });
+    </script>
+  </body>
+</html>

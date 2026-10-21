@@ -1,15 +1,13 @@
 /**
- * Zero-dependency build for the Always Online plugin.
+ * Zero-dependency build.
  *
- *   node build.mjs            build dist/
- *   node build.mjs --serve    build, then serve dist/ over http for Kettu's dev loader
- *   node build.mjs --watch    rebuild whenever src/ changes (combine with --serve)
+ *   node build.mjs                     build DevTools/
+ *   node build.mjs --serve --watch     rebuild on save and serve over http for Kettu's dev loader
  *
- * Kettu evaluates a plugin's main file as `return <file contents>`, so the bundle
- * has to be a single JavaScript expression. The wrapper below is one IIFE that
- * hands the source a CommonJS-looking `module`, then returns its exports - and
- * also assigns them to an outer `module` if the loader supplied one, so the same
- * file works under either convention.
+ * Output goes to a folder named after the plugin at the repo root, so GitHub
+ * Pages serves it at https://<user>.github.io/<repo>/<Plugin>/ - the layout
+ * Kettu expects, where the install URL is a folder and Kettu appends
+ * manifest.json itself.
  */
 
 import { createHash } from "node:crypto";
@@ -20,7 +18,8 @@ import { extname, join, resolve } from "node:path";
 const root = resolve(import.meta.dirname ?? new URL(".", import.meta.url).pathname);
 const SRC = join(root, "src", "index.js");
 const MANIFEST = join(root, "manifest.json");
-const DIST = join(root, "dist");
+const PLUGIN_DIR = "DevTools";
+const OUT = join(root, PLUGIN_DIR);
 
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(`--${name}`);
@@ -30,7 +29,7 @@ const flagValue = (name, fallback) => {
 };
 
 function wrap(source, manifest) {
-  // The bundle MUST begin with "(" on the very first character. Kettu evaluates it
+  // The bundle MUST begin with "(" as its very first character. Kettu evaluates it
   // as `return <contents>`, and a newline (or a leading comment followed by one)
   // right after `return` triggers automatic semicolon insertion, which turns the
   // entire plugin into dead code that silently loads as nothing. Banner goes inside.
@@ -55,30 +54,26 @@ async function build() {
   const manifest = JSON.parse(await readFile(MANIFEST, "utf8"));
 
   const bundle = wrap(source, manifest);
+  // Kettu only refetches a plugin's code when this hash changes.
   const hash = createHash("sha256").update(bundle).digest("hex");
 
-  await mkdir(DIST, { recursive: true });
-  await writeFile(join(DIST, "index.js"), bundle);
-  // Kettu only refetches a plugin's code when this hash changes.
-  await writeFile(
-    join(DIST, "manifest.json"),
-    JSON.stringify({ ...manifest, hash }, null, 2) + "\n"
-  );
+  await mkdir(OUT, { recursive: true });
+  await writeFile(join(OUT, "index.js"), bundle);
+  await writeFile(join(OUT, "manifest.json"), JSON.stringify({ ...manifest, hash }, null, 2) + "\n");
 
-  console.log(
-    `built dist/index.js (${(bundle.length / 1024).toFixed(1)} kb)\n` +
-      `  hash ${hash}`
-  );
+  console.log(`built ${PLUGIN_DIR}/index.js (${(bundle.length / 1024).toFixed(1)} kb)\n  hash ${hash}`);
   return { bundle, manifest, hash };
 }
 
-const TYPES = { ".js": "application/javascript", ".json": "application/json" };
+const TYPES = { ".js": "application/javascript", ".json": "application/json", ".html": "text/html" };
 
 function serve(port) {
   createServer(async (req, res) => {
-    const name = (req.url || "/").split("?")[0].replace(/^\/+/, "") || "index.js";
+    // Accept both "/" and "/DevTools/" so the same URL shape works in dev and in prod.
+    let name = (req.url || "/").split("?")[0].replace(/^\/+/, "").replace(/^DevTools\/?/, "");
+    if (!name) name = "manifest.json";
     try {
-      const body = await readFile(join(DIST, name));
+      const body = await readFile(join(OUT, name));
       res.writeHead(200, {
         "content-type": TYPES[extname(name)] ?? "text/plain",
         "access-control-allow-origin": "*",
@@ -91,8 +86,8 @@ function serve(port) {
       console.log(`404 ${name}`);
     }
   }).listen(port, () => {
-    console.log(`serving dist/ on http://0.0.0.0:${port}/`);
-    console.log("point Kettu's plugin install at http://<this-machine-lan-ip>:" + port + "/");
+    console.log(`serving ${PLUGIN_DIR}/ on http://0.0.0.0:${port}/`);
+    console.log(`install http://<this-machine-lan-ip>:${port}/ in Kettu`);
   });
 }
 
@@ -101,7 +96,7 @@ await build();
 if (flag("serve")) serve(Number(flagValue("port", 4040)));
 
 if (flag("watch")) {
-  console.log("watching src/ and manifest.json");
+  console.log("watching src/");
   for await (const _ of watch(join(root, "src"), { recursive: true })) {
     try {
       await build();

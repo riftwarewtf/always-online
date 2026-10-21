@@ -1,111 +1,108 @@
-# Always Online
+# Kettu Plugins
 
-A presence plugin for [Kettu](https://codeberg.org/cocobo1/Kettu) — also loads on Bunny and Vendetta, since it resolves its API from whichever global is present.
-
-It stops the Discord mobile client from ever telling the gateway you are idle, afk or offline, and gives you a full custom rich presence.
-
-## Read this first
-
-Your online status is a property of the **gateway websocket**, not of a setting. When the OS suspends Discord, that socket dies and you go offline no matter what any plugin does.
-
-- **iOS** suspends a backgrounded app within seconds. You will go offline shortly after leaving the app.
-- **Android** holds much longer with battery optimization disabled for Discord, but it is still not a guarantee.
-
-So this plugin does not give you literal 24/7. What it actually does:
-
-- you never go **idle** while the app is alive, no matter how long you sit there
-- backgrounding no longer reports idle, because the frame that does it gets rewritten
-- you are online **from the first packet** of every reconnect, including after a suspend
-- your presence is re-asserted on a timer, so Discord cannot quietly clear it
-
-For a status that is genuinely always on, you want a standalone gateway client on a machine that never sleeps. This is the honest ceiling on a phone.
+Plugins for [Kettu](https://codeberg.org/cocobo1/Kettu), laid out so GitHub Pages serves each one from its own folder. They also load on Bunny and Vendetta, since the API is resolved from whichever global is present.
 
 ## Install
 
-In Kettu: **Settings → Plugins → + ** and paste the folder URL (Kettu appends `manifest.json` itself):
+Kettu takes a **folder URL** and appends `manifest.json` itself. A `github.com/...` repo link will always fail with *"Failed to fetch manifest"* — that URL serves an HTML page, not JSON.
+
+Once Pages is enabled on this repo (Settings → Pages → Deploy from a branch → `main` → `/ (root)`):
 
 ```
-https://raw.githubusercontent.com/riftwarewtf/always-online/main/dist/
+https://riftwarewtf.github.io/always-online/DevTools/
 ```
 
-The trailing slash matters, and it has to be the raw host — a normal `github.com/.../tree/...` page will not work. If `raw.githubusercontent.com` is being slow to update, jsDelivr works too, though it caches harder:
+Works right now without Pages, same thing:
 
 ```
-https://cdn.jsdelivr.net/gh/riftwarewtf/always-online@main/dist/
+https://raw.githubusercontent.com/riftwarewtf/always-online/main/DevTools/
 ```
 
-## Settings
+Trailing slash matters.
 
-**Keep online**
+---
 
-| Setting | What it does |
-| --- | --- |
-| Enabled | Master switch. Off means no frames are touched at all. |
-| Suppress idle detection | Also forces the client's own `IdleStore` to report "not idle", so the UI stops flipping you to idle locally. Needs a reload to change. |
-| Appear as desktop | Rewrites the identify handshake's client properties, dropping the mobile indicator. Off by default — it changes what your account reports as its client. |
-| Re-assert every | Keepalive interval in seconds. Floored at 15, because gateway presence updates are rate limited (roughly 5 per 20s). 60 is comfortable. |
+## DevTools
 
-**Status** — online, idle, dnd or invisible. Whatever you pick is what every outgoing frame says, including the ones Discord meant to send as idle.
+A debugging panel in the shape of Safari's Web Inspector, five tabs deep. Capture starts when the plugin loads and keeps running whether or not the panel is open, so you can trigger a bug and then go look at what happened.
 
-**Custom presence** — pick a type and fill in the lines:
+**Console** — every `console.log` / `info` / `warn` / `error` / `debug` in the app, with level filters, text search, timestamps. Tap a line to expand it into a full depth-4 inspection of the logged objects, long press to copy. Uncaught errors and fatals land here tagged `crash`, and the app's own handler still runs afterwards — swallowing crashes would hide them from Discord's reporting.
 
-- *Playing / Listening to / Watching / Competing in* — `name` is the bold title, `details` is the first line under it, `state` is the second.
-- *Streaming* — same, plus a Twitch or YouTube URL to get the purple live treatment.
-- *Custom* — a single line of status text. Type 4 is a special shape and other clients render it inconsistently from a gateway presence; Discord's own custom status is more reliable if that is all you want.
-- *Show elapsed time* — adds the ticking `00:42 elapsed` timer.
+**Eval** — a REPL against the live app. `api`, `metro`, `find(...props)`, `store(name)`, `common`, `React`, `ReactNative`, `storage`, `inspect(v)` and `$` (the previous result) are all in scope. Expressions return their value, multi-line code takes an explicit `return`. History is kept so you can tap a previous snippet to bring it back.
 
-**Images** — asset keys are resolved against an application, so the application ID and the key are a pair. Create an app in the Discord developer portal, upload art under Rich Presence assets, then put the app's ID and your asset names here. Keys without an app ID render nothing.
+```js
+store("UserStore").getCurrentUser().username
+find("getCurrentUser", "getUser")
+Object.keys($)
+```
 
-**Diagnostics** — whether the gateway socket was captured, which encoding it is using, how many frames have been rewritten, and a copyable debug log. Check here first if something looks wrong.
+**Network** — HTTP via `XMLHttpRequest`, which is what React Native's `fetch` is built on, so both show up. Method, status, duration, URL; tap for request body, response headers and response body. WebSocket capture (outgoing frames) is a separate toggle, off by default because the gateway is relentless.
 
-## How it works
+**Modules** — search Metro's registry by exported prop name, see which module ids match, drill into any export to inspect its value. Only already-initialized modules are read: forcing a lazy one runs its side effects, which is a good way to break the app from inside a debugger.
 
-Three mechanisms, layered so that a failure in one does not take the feature with it.
+**Device** — build and engine info (Discord build, React, React Native, Hermes bytecode version, device, window metrics), the capture toggles, buffer size, and the React DevTools bridge.
 
-**1. Outgoing frame rewriting.** `WebSocket.prototype.send` is monkey-patched, and frames on a socket whose URL looks like the Discord gateway get parsed and edited on the way out:
+### React DevTools
 
-- **op 2 IDENTIFY** gets `d.presence` injected, so the very first packet of a connection already carries your status. This is what makes reconnects land online instead of flickering.
-- **op 3 PRESENCE_UPDATE** is overwritten wholesale. This is the frame Discord fires when it decides you went idle or the app got backgrounded, and rewriting it is cheaper and far more version-proof than hunting the module that produced it. Activities Discord supplied itself (a Spotify session, for instance) are preserved when you have not configured one.
+The one piece that gives you an actual element inspector. On your Mac:
 
-Patching at the socket layer means this does not depend on a single Discord internal module name, which is what usually breaks presence plugins after an app update.
+```sh
+npx react-devtools
+```
 
-**2. Flux dispatch.** Activities are also pushed through `LOCAL_ACTIVITY_UPDATE` on the FluxDispatcher. Discord serialises that one itself, so it still works when the gateway is speaking ETF rather than JSON — binary frames cannot be safely rewritten and are passed through untouched.
+Put the machine's LAN address and port in the Device tab (`192.168.1.20:8097`) and hit Connect. You get the real component tree, props and state, live. This needs the mod to expose `connectToDebugger` on its debug API; if the build doesn't have it, the tab says so instead of failing silently.
 
-**3. Idle suppression.** If `IdleStore` is findable, its `isIdle` / `isAFK` / `getIdleSince` are overridden so the client's local bookkeeping never considers you away. Every override is restored on unload.
+### What it cannot do
 
-Nothing here writes to your account's saved status. It only edits what goes over the wire, so disabling the plugin leaves no trace on your settings.
+**There is no JavaScript source to show you.** Discord's mobile app ships compiled Hermes bytecode — `Function.prototype.toString` on anything Discord wrote returns `[bytecode]`, and no plugin can recover the original text because it is not in the app. That is the engine, not a missing feature.
+
+What you get instead is the live surface: every export, its type, its current value, store state, function names and arity. For actual decompilation you need the APK/IPA and `hbctool` or `hermes-dec` on a desktop, which is a different job entirely.
+
+Everything is also reachable programmatically while the plugin is loaded, for use from the Eval tab or another plugin:
+
+```js
+__devtools.logs          // captured log entries
+__devtools.requests      // captured network entries
+__devtools.searchModules("getCurrentUser")
+__devtools.inspect(value)
+```
+
+---
 
 ## Building
 
 No dependencies, Node 18+ (or Bun):
 
 ```sh
-node build.mjs            # writes dist/index.js and dist/manifest.json
-node test/smoke.mjs       # fake gateway + fake runtime, asserts frames come out rewritten
+node build.mjs          # writes DevTools/index.js and DevTools/manifest.json
+node test/smoke.mjs     # fake RN runtime: capture, eval, module search, all five tabs render
 ```
 
-`dist/manifest.json` carries a `hash`, the sha256 of the bundle. Kettu only refetches plugin code when that hash changes, so the build recomputes it every time — commit both files or installs will serve stale code.
+`manifest.json` carries a `hash`, the sha256 of the bundle. Kettu only refetches plugin code when that hash changes, so the build recomputes it every time — commit the built folder or installs serve stale code.
 
-For live development, Kettu can load a plugin off a local HTTP server:
+For live development Kettu can load from a local HTTP server:
 
 ```sh
 node build.mjs --serve --watch --port=4040
 ```
 
-Then install `http://<your-lan-ip>:4040/` in Kettu and it rebuilds on every save.
+Then install `http://<your-lan-ip>:4040/` and it rebuilds on every save.
 
-### The one build detail that matters
+### The build detail that matters
 
-Kettu evaluates a plugin's main file as `return <file contents>`. JavaScript's automatic semicolon insertion means a newline straight after `return` ends the statement — so a bundle that opens with a banner comment, or with a blank line, silently loads as nothing at all. `dist/index.js` must begin with `(` as its literal first character. `build.mjs` wraps the source in a single IIFE expression that keeps the banner inside, and hands it a CommonJS-shaped `module` so the same file also works under a loader that wraps it as `new Function("module", "exports", code)`.
+Kettu evaluates a plugin's main file as `return <file contents>`. JavaScript's automatic semicolon insertion means a newline straight after `return` ends the statement — so a bundle that opens with a banner comment, or a blank line, silently loads as nothing at all. `DevTools/index.js` begins with `(` as its literal first character. `build.mjs` wraps the source in one IIFE expression with the banner inside, and hands it a CommonJS-shaped `module`, so the same file also works under a loader that wraps it as `new Function("module", "exports", code)`.
 
 ## Layout
 
 ```
-src/index.js      the plugin, one self-contained file, no imports
-manifest.json     source of truth for name/version/author
-build.mjs         wraps src into dist/index.js, stamps the hash, optional dev server
-test/smoke.mjs    fake gateway and fake Kettu runtime
-dist/             what Kettu actually installs — committed on purpose
+src/index.js       the plugin, one self-contained file, no imports
+manifest.json      source of truth for name/version/author
+build.mjs          wraps src into DevTools/, stamps the hash, optional dev server
+test/smoke.mjs     fake React Native runtime and fake Kettu api
+DevTools/          what Kettu installs - committed on purpose, this is what Pages serves
+index.html         landing page listing the plugins and their install URLs
 ```
 
-`src/index.js` deliberately imports nothing. It reads its API off `globalThis.kettu ?? globalThis.bunny ?? globalThis.vendetta` and degrades gracefully when a lookup fails, which is why there is no bundler in the toolchain and why the same file works across all three mods.
+`src/index.js` imports nothing. It reads its API off `globalThis.kettu ?? globalThis.bunny ?? globalThis.vendetta`, tries both the old `findByProps` and the newer `filters.byProps` + `findExports` shapes, and degrades to a message in the UI when a lookup misses rather than throwing. That is why there is no bundler here and why one file works across all three mods.
+
+Adding a second plugin means a second source file and a second output folder, each with its own manifest and install URL — the folders are independent.

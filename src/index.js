@@ -1,18 +1,17 @@
 /**
- * Always Online
- * A presence plugin for Kettu (also works on Bunny / Vendetta).
+ * DevTools
+ * A web-inspector-style debugging panel for Kettu (also loads on Bunny / Vendetta).
  *
- * How it works, in three sentences:
- *  1. It monkey-patches `WebSocket.prototype.send` and rewrites every frame Discord
- *     sends to the gateway, so an IDENTIFY (op 2) carries our presence from the very
- *     first packet and any PRESENCE_UPDATE (op 3) the client tries to send as
- *     idle/offline/afk comes out as whatever we configured instead.
- *  2. A keepalive timer re-asserts that presence periodically, which also survives
- *     Discord clearing activities on its own.
- *  3. Activities are additionally pushed through FluxDispatcher's LOCAL_ACTIVITY_UPDATE,
- *     which is encoding-agnostic and works even when the gateway speaks ETF.
+ * Tabs: Console, Eval, Network, Modules, Device.
  *
- * Nothing here touches your account's saved status setting - it only rewrites the wire.
+ * Capture starts at plugin load and keeps running whether or not the panel is
+ * open, so you can trigger a bug, then come look at what happened.
+ *
+ * On source viewing: Discord's mobile app ships as Hermes bytecode, so
+ * Function.prototype.toString returns "[bytecode]" for anything Discord wrote.
+ * No plugin can recover that text - it is not in the binary. What is available,
+ * and what the Modules tab shows, is the live export surface: keys, types,
+ * values, store state and function arity.
  */
 
 /* ------------------------------------------------------------------ *
@@ -20,36 +19,8 @@
  * ------------------------------------------------------------------ */
 
 var G = typeof globalThis !== "undefined" ? globalThis : window;
-
-// Kettu and Bunny expose `bunny`; Vendetta exposes `vendetta`. Try all of them.
 var api = G.kettu || G.bunny || G.vendetta || {};
 
-var LOG_PREFIX = "[always-online]";
-var debugLines = [];
-
-function log() {
-  var parts = Array.prototype.slice.call(arguments);
-  var line = parts
-    .map(function (p) {
-      if (p instanceof Error) return p.message;
-      if (typeof p === "object") {
-        try {
-          return JSON.stringify(p);
-        } catch (e) {
-          return String(p);
-        }
-      }
-      return String(p);
-    })
-    .join(" ");
-  debugLines.push(line);
-  if (debugLines.length > 60) debugLines.shift();
-  try {
-    console.log(LOG_PREFIX + " " + line);
-  } catch (e) {}
-}
-
-/** metro: find a module by the props it exports, across api generations. */
 function findByProps() {
   var props = Array.prototype.slice.call(arguments);
   var m = api.metro;
@@ -62,13 +33,10 @@ function findByProps() {
       if (typeof m.findExports === "function") return m.findExports(filter);
       if (typeof m.find === "function") return m.find(filter);
     }
-  } catch (e) {
-    log("findByProps(" + props.join(",") + ") threw:", e);
-  }
+  } catch (e) {}
   return undefined;
 }
 
-/** metro: find a flux store by name, across api generations. */
 function findByStoreName(name) {
   var m = api.metro;
   if (!m) return undefined;
@@ -80,23 +48,23 @@ function findByStoreName(name) {
       if (typeof m.findExports === "function") return m.findExports(filter);
       if (typeof m.find === "function") return m.find(filter);
     }
-  } catch (e) {
-    log("findByStoreName(" + name + ") threw:", e);
-  }
+  } catch (e) {}
   return undefined;
 }
 
 var common = (api.metro && api.metro.common) || {};
 var React = common.React || G.React || findByProps("createElement", "useState");
 var ReactNative = common.ReactNative || findByProps("ScrollView", "StyleSheet", "AppState");
-var FluxDispatcher = common.FluxDispatcher || findByProps("dispatch", "subscribe", "_actionHandlers");
 
-/** persistent storage, proxied and auto-saving on Vendetta-family loaders. */
 var storage =
   (api.plugin && api.plugin.storage) ||
   (api.plugins && api.plugins.storage) ||
   api.storage ||
   {};
+
+function clipboard() {
+  return common.clipboard || findByProps("setString", "getString");
+}
 
 function toast(text) {
   try {
@@ -106,402 +74,589 @@ function toast(text) {
   } catch (e) {}
 }
 
-/* ------------------------------------------------------------------ *
- * settings schema + defaults                                          *
- * ------------------------------------------------------------------ */
-
-var STATUSES = ["online", "idle", "dnd", "invisible"];
-
-var ACTIVITY_TYPES = [
-  { value: 0, label: "Playing" },
-  { value: 1, label: "Streaming" },
-  { value: 2, label: "Listening to" },
-  { value: 3, label: "Watching" },
-  { value: 5, label: "Competing in" },
-  { value: 4, label: "Custom" }
-];
+function copy(text) {
+  var cb = clipboard();
+  if (cb && typeof cb.setString === "function") {
+    cb.setString(String(text));
+    toast("Copied");
+    return true;
+  }
+  toast("No clipboard module found");
+  return false;
+}
 
 var DEFAULTS = {
-  enabled: true,
-  status: "online",
-  keepaliveSeconds: 60,
-  suppressIdle: true,
-  spoofDesktop: false,
-  activity: {
-    enabled: false,
-    type: 0,
-    name: "",
-    details: "",
-    state: "",
-    url: "",
-    applicationId: "",
-    largeImage: "",
-    largeText: "",
-    smallImage: "",
-    smallText: "",
-    showElapsed: true
-  }
+  captureConsole: true,
+  captureNetwork: true,
+  captureWebSocket: false,
+  captureErrors: true,
+  maxEntries: 500,
+  bodyLimit: 2000,
+  devtoolsHost: ""
 };
 
-/** fill in anything missing without clobbering what the user already set. */
 function applyDefaults() {
   for (var key in DEFAULTS) {
     if (!Object.prototype.hasOwnProperty.call(DEFAULTS, key)) continue;
-    var def = DEFAULTS[key];
-    if (def && typeof def === "object" && !Array.isArray(def)) {
-      if (typeof storage[key] !== "object" || storage[key] === null) storage[key] = {};
-      for (var sub in def) {
-        if (!Object.prototype.hasOwnProperty.call(def, sub)) continue;
-        if (typeof storage[key][sub] === "undefined") storage[key][sub] = def[sub];
-      }
-    } else if (typeof storage[key] === "undefined") {
-      storage[key] = def;
+    if (typeof storage[key] === "undefined") storage[key] = DEFAULTS[key];
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * value inspection                                                    *
+ * ------------------------------------------------------------------ */
+
+function typeOf(value) {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+function describeFunction(fn) {
+  var name = fn.name || "anonymous";
+  return "ƒ " + name + "(" + fn.length + ")";
+}
+
+/** Safe, depth-limited, cycle-aware stringify for display. */
+function inspect(value, depth, seen) {
+  depth = typeof depth === "number" ? depth : 2;
+  seen = seen || [];
+
+  var t = typeOf(value);
+
+  if (t === "undefined") return "undefined";
+  if (t === "null") return "null";
+  if (t === "string") return JSON.stringify(value);
+  if (t === "number" || t === "boolean") return String(value);
+  if (t === "bigint") return String(value) + "n";
+  if (t === "symbol") return String(value);
+  if (t === "function") return describeFunction(value);
+
+  if (value instanceof Error) {
+    return value.name + ": " + value.message + (value.stack ? "\n" + value.stack : "");
+  }
+
+  if (seen.indexOf(value) !== -1) return "[circular]";
+  if (depth < 0) return t === "array" ? "[…]" : "{…}";
+
+  var nextSeen = seen.concat([value]);
+
+  if (t === "array") {
+    if (!value.length) return "[]";
+    var items = [];
+    for (var i = 0; i < Math.min(value.length, 50); i++) {
+      items.push(inspect(value[i], depth - 1, nextSeen));
     }
+    if (value.length > 50) items.push("… " + (value.length - 50) + " more");
+    return "[" + items.join(", ") + "]";
   }
+
+  var keys;
+  try {
+    keys = Object.keys(value);
+  } catch (e) {
+    return "[unreadable object]";
+  }
+  if (!keys.length) {
+    var ctor = value.constructor && value.constructor.name;
+    return ctor && ctor !== "Object" ? ctor + " {}" : "{}";
+  }
+
+  var parts = [];
+  for (var k = 0; k < Math.min(keys.length, 40); k++) {
+    var key = keys[k];
+    var entry;
+    try {
+      entry = inspect(value[key], depth - 1, nextSeen);
+    } catch (e) {
+      entry = "[throws]";
+    }
+    parts.push(key + ": " + entry);
+  }
+  if (keys.length > 40) parts.push("… " + (keys.length - 40) + " more");
+  return "{ " + parts.join(", ") + " }";
+}
+
+function truncate(text, limit) {
+  text = String(text);
+  if (text.length <= limit) return text;
+  return text.slice(0, limit) + "\n… truncated, " + (text.length - limit) + " more chars";
 }
 
 /* ------------------------------------------------------------------ *
- * live state                                                          *
+ * capture buffers                                                     *
  * ------------------------------------------------------------------ */
 
-var state = {
-  running: false,
-  socket: null,
-  socketEncoding: "unknown",
-  identifyRewrites: 0,
-  presenceRewrites: 0,
-  keepalivesSent: 0,
-  lastApplied: null,
-  activityStartedAt: Date.now(),
-  originalSend: null,
-  idleUnpatchers: [],
-  timer: null
-};
+var logs = [];
+var requests = [];
+var nextId = 1;
+var listeners = [];
+var emitQueued = false;
 
-/* ------------------------------------------------------------------ *
- * presence construction                                              *
- * ------------------------------------------------------------------ */
-
-function buildActivity() {
-  var cfg = storage.activity || {};
-  if (!cfg.enabled) return null;
-
-  var type = Number(cfg.type);
-  if (isNaN(type)) type = 0;
-
-  // Custom status (type 4) has its own shape: the text lives in `state` and the
-  // name is required to be the literal "Custom Status".
-  if (type === 4) {
-    if (!cfg.state) return null;
-    return { name: "Custom Status", type: 4, state: String(cfg.state) };
-  }
-
-  if (!cfg.name) return null;
-
-  var activity = { name: String(cfg.name), type: type };
-
-  if (cfg.details) activity.details = String(cfg.details);
-  if (cfg.state) activity.state = String(cfg.state);
-
-  // Streaming only renders as a purple "live" presence with a twitch/youtube url.
-  if (type === 1 && cfg.url) activity.url = String(cfg.url);
-
-  var assets = {};
-  if (cfg.largeImage) assets.large_image = String(cfg.largeImage);
-  if (cfg.largeText) assets.large_text = String(cfg.largeText);
-  if (cfg.smallImage) assets.small_image = String(cfg.smallImage);
-  if (cfg.smallText) assets.small_text = String(cfg.smallText);
-  if (Object.keys(assets).length) activity.assets = assets;
-
-  // Asset keys are resolved against an application, so images need the app id too.
-  if (cfg.applicationId) activity.application_id = String(cfg.applicationId);
-
-  if (cfg.showElapsed) activity.timestamps = { start: state.activityStartedAt };
-
-  return activity;
-}
-
-/** the `d` payload of a gateway PRESENCE_UPDATE (op 3). */
-function buildPresence() {
-  var status = STATUSES.indexOf(storage.status) === -1 ? "online" : storage.status;
-  var activity = buildActivity();
-  return {
-    status: status,
-    since: 0,
-    activities: activity ? [activity] : [],
-    afk: false
+function subscribe(fn) {
+  listeners.push(fn);
+  return function () {
+    var i = listeners.indexOf(fn);
+    if (i !== -1) listeners.splice(i, 1);
   };
 }
 
+/** Coalesce notifications so a chatty log does not re-render the panel per line. */
+function emit() {
+  if (emitQueued) return;
+  emitQueued = true;
+  setTimeout(function () {
+    emitQueued = false;
+    for (var i = 0; i < listeners.length; i++) {
+      try {
+        listeners[i]();
+      } catch (e) {}
+    }
+  }, 200);
+}
+
+function cap() {
+  var max = Number(storage.maxEntries);
+  return isNaN(max) || max < 20 ? 500 : max;
+}
+
+function pushLog(level, parts, source) {
+  var summary = parts
+    .map(function (p) {
+      return typeof p === "string" ? p : inspect(p, 2);
+    })
+    .join(" ");
+
+  logs.push({
+    id: nextId++,
+    level: level,
+    source: source || "app",
+    time: Date.now(),
+    summary: summary,
+    detail: parts.length === 1 ? inspect(parts[0], 4) : parts.map(function (p) {
+      return inspect(p, 4);
+    }).join("\n")
+  });
+
+  while (logs.length > cap()) logs.shift();
+  emit();
+}
+
+function pushRequest(entry) {
+  requests.push(entry);
+  while (requests.length > cap()) requests.shift();
+  emit();
+}
+
 /* ------------------------------------------------------------------ *
- * gateway frame rewriting                                             *
+ * console capture                                                     *
  * ------------------------------------------------------------------ */
 
-function isGatewayUrl(url) {
-  if (typeof url !== "string") return false;
-  return url.indexOf("gateway") !== -1 && url.indexOf("discord") !== -1;
+var CONSOLE_METHODS = ["log", "info", "warn", "error", "debug"];
+var originalConsole = {};
+
+function patchConsole() {
+  if (!storage.captureConsole || !G.console) return;
+  CONSOLE_METHODS.forEach(function (method) {
+    var original = G.console[method];
+    if (typeof original !== "function") return;
+    originalConsole[method] = original;
+    G.console[method] = function () {
+      var args = Array.prototype.slice.call(arguments);
+      try {
+        pushLog(method === "info" ? "log" : method, args);
+      } catch (e) {}
+      // Always pass through, so the real logger (and any other hook) still sees it.
+      return original.apply(G.console, arguments);
+    };
+    G.console[method].__devtools = true;
+  });
 }
 
-/**
- * Rewrites one outgoing gateway frame. Returns the replacement string, or null
- * to send the original untouched.
- */
-function rewriteFrame(raw) {
-  var payload;
-  try {
-    payload = JSON.parse(raw);
-  } catch (e) {
-    return null;
-  }
-  if (!payload || typeof payload !== "object") return null;
-
-  // op 2 IDENTIFY: ride along on the handshake so we are online from packet one.
-  if (payload.op === 2 && payload.d) {
-    payload.d.presence = buildPresence();
-    if (storage.spoofDesktop && payload.d.properties) {
-      payload.d.properties.browser = "Discord Client";
-      payload.d.properties.os = "Mac OS X";
-      delete payload.d.properties.browser_user_agent;
+function unpatchConsole() {
+  CONSOLE_METHODS.forEach(function (method) {
+    if (!originalConsole[method]) return;
+    if (G.console[method] && G.console[method].__devtools) {
+      G.console[method] = originalConsole[method];
     }
-    state.identifyRewrites++;
-    state.lastApplied = Date.now();
-    log("rewrote IDENTIFY, presence =", payload.d.presence.status);
-    try {
-      return JSON.stringify(payload);
-    } catch (e) {
-      return null;
-    }
-  }
-
-  // op 3 PRESENCE_UPDATE: this is the one Discord fires when it thinks you went
-  // idle or the app got backgrounded. Overwrite it wholesale.
-  if (payload.op === 3) {
-    var wanted = buildPresence();
-    var incoming = payload.d || {};
-    // Keep the client's own activities when we are not supplying any, so things
-    // like Spotify or a voice session are not wiped out.
-    if (!wanted.activities.length && Array.isArray(incoming.activities)) {
-      wanted.activities = incoming.activities;
-    }
-    payload.d = wanted;
-    state.presenceRewrites++;
-    state.lastApplied = Date.now();
-    try {
-      return JSON.stringify(payload);
-    } catch (e) {
-      return null;
-    }
-  }
-
-  return null;
+    delete originalConsole[method];
+  });
 }
+
+/* ------------------------------------------------------------------ *
+ * uncaught error capture                                              *
+ * ------------------------------------------------------------------ */
+
+var previousErrorHandler = null;
+var errorHandlerInstalled = false;
+
+function patchErrors() {
+  if (!storage.captureErrors) return;
+  var EU = G.ErrorUtils;
+  if (!EU || typeof EU.setGlobalHandler !== "function") return;
+
+  previousErrorHandler =
+    typeof EU.getGlobalHandler === "function" ? EU.getGlobalHandler() : null;
+
+  EU.setGlobalHandler(function (error, isFatal) {
+    try {
+      pushLog("error", [(isFatal ? "[fatal] " : "[uncaught] ") + (error && error.message), error], "crash");
+    } catch (e) {}
+    if (typeof previousErrorHandler === "function") {
+      return previousErrorHandler(error, isFatal);
+    }
+  });
+  errorHandlerInstalled = true;
+}
+
+function unpatchErrors() {
+  if (!errorHandlerInstalled) return;
+  var EU = G.ErrorUtils;
+  if (EU && typeof EU.setGlobalHandler === "function") {
+    // If there was no handler before us, leave a no-op rather than our own:
+    // setGlobalHandler(null) is not safe on every runtime.
+    EU.setGlobalHandler(
+      typeof previousErrorHandler === "function" ? previousErrorHandler : function () {}
+    );
+  }
+  errorHandlerInstalled = false;
+  previousErrorHandler = null;
+}
+
+/* ------------------------------------------------------------------ *
+ * network capture                                                     *
+ * ------------------------------------------------------------------ */
+
+var originalOpen = null;
+var originalXhrSend = null;
+
+/** fetch() in React Native is implemented on top of XMLHttpRequest, so one hook covers both. */
+function patchNetwork() {
+  if (!storage.captureNetwork) return;
+  var XHR = G.XMLHttpRequest;
+  if (!XHR || !XHR.prototype) return;
+
+  originalOpen = XHR.prototype.open;
+  originalXhrSend = XHR.prototype.send;
+
+  XHR.prototype.open = function (method, url) {
+    try {
+      this.__devtools = { method: String(method || "GET").toUpperCase(), url: String(url || "") };
+    } catch (e) {}
+    return originalOpen.apply(this, arguments);
+  };
+
+  XHR.prototype.send = function (body) {
+    var meta = this.__devtools;
+    if (meta) {
+      meta.started = Date.now();
+      meta.requestBody = body ? truncate(typeof body === "string" ? body : inspect(body, 2), Number(storage.bodyLimit) || 2000) : "";
+
+      var self = this;
+      var finish = function (outcome) {
+        if (meta.done) return;
+        meta.done = true;
+
+        var responseBody = "";
+        try {
+          // responseText throws for blob/arraybuffer response types.
+          if (!self.responseType || self.responseType === "text") {
+            responseBody = truncate(self.responseText || "", Number(storage.bodyLimit) || 2000);
+          } else {
+            responseBody = "[" + self.responseType + " response]";
+          }
+        } catch (e) {
+          responseBody = "[unreadable response]";
+        }
+
+        var headers = "";
+        try {
+          headers = self.getAllResponseHeaders ? self.getAllResponseHeaders() : "";
+        } catch (e) {}
+
+        pushRequest({
+          id: nextId++,
+          kind: "http",
+          method: meta.method,
+          url: meta.url,
+          status: outcome === "error" ? 0 : self.status,
+          outcome: outcome,
+          ms: Date.now() - meta.started,
+          time: meta.started,
+          requestBody: meta.requestBody,
+          responseHeaders: headers,
+          responseBody: responseBody
+        });
+      };
+
+      try {
+        if (typeof this.addEventListener === "function") {
+          this.addEventListener("load", function () {
+            finish("load");
+          });
+          this.addEventListener("error", function () {
+            finish("error");
+          });
+          this.addEventListener("abort", function () {
+            finish("abort");
+          });
+          this.addEventListener("timeout", function () {
+            finish("timeout");
+          });
+        } else {
+          var previous = this.onreadystatechange;
+          this.onreadystatechange = function () {
+            if (self.readyState === 4) finish("load");
+            if (typeof previous === "function") return previous.apply(self, arguments);
+          };
+        }
+      } catch (e) {}
+    }
+    return originalXhrSend.apply(this, arguments);
+  };
+  XHR.prototype.open.__devtools = true;
+  XHR.prototype.send.__devtools = true;
+}
+
+function unpatchNetwork() {
+  var XHR = G.XMLHttpRequest;
+  if (!XHR || !XHR.prototype) return;
+  if (originalOpen && XHR.prototype.open && XHR.prototype.open.__devtools) XHR.prototype.open = originalOpen;
+  if (originalXhrSend && XHR.prototype.send && XHR.prototype.send.__devtools) XHR.prototype.send = originalXhrSend;
+  originalOpen = null;
+  originalXhrSend = null;
+}
+
+/* ------------------------------------------------------------------ *
+ * websocket capture (outgoing frames)                                 *
+ * ------------------------------------------------------------------ */
+
+var originalWsSend = null;
 
 function patchWebSocket() {
+  if (!storage.captureWebSocket) return;
   var WS = G.WebSocket;
-  if (!WS || !WS.prototype || typeof WS.prototype.send !== "function") {
-    log("WebSocket.prototype.send not available - gateway rewriting disabled");
-    return false;
-  }
+  if (!WS || !WS.prototype || typeof WS.prototype.send !== "function") return;
 
-  var original = WS.prototype.send;
-  state.originalSend = original;
-
-  WS.prototype.send = function alwaysOnlineSend(data) {
+  originalWsSend = WS.prototype.send;
+  WS.prototype.send = function (data) {
     try {
-      var url = this.url || this._url;
-      if (isGatewayUrl(url) && storage.enabled) {
-        state.socket = this;
-        if (typeof data === "string") {
-          state.socketEncoding = "json";
-          var replacement = rewriteFrame(data);
-          if (replacement !== null) {
-            return original.call(this, replacement);
-          }
-        } else {
-          // ETF / binary frame. We cannot safely rewrite it, so activities go
-          // through FluxDispatcher instead and status relies on idle suppression.
-          state.socketEncoding = "etf";
-        }
-      }
-    } catch (e) {
-      log("send hook error:", e);
-    }
-    return original.apply(this, arguments);
+      pushRequest({
+        id: nextId++,
+        kind: "ws",
+        method: "SEND",
+        url: this.url || this._url || "websocket",
+        status: this.readyState,
+        outcome: "sent",
+        ms: 0,
+        time: Date.now(),
+        requestBody: typeof data === "string"
+          ? truncate(data, Number(storage.bodyLimit) || 2000)
+          : "[binary frame, " + (data && data.byteLength ? data.byteLength + " bytes" : "unknown size") + "]",
+        responseHeaders: "",
+        responseBody: ""
+      });
+    } catch (e) {}
+    return originalWsSend.apply(this, arguments);
   };
-  WS.prototype.send.__alwaysOnline = true;
-
-  log("patched WebSocket.prototype.send");
-  return true;
+  WS.prototype.send.__devtools = true;
 }
 
 function unpatchWebSocket() {
   var WS = G.WebSocket;
-  if (!WS || !state.originalSend) return;
-  // Only restore if nobody patched on top of us, otherwise we would clobber them.
-  if (WS.prototype.send && WS.prototype.send.__alwaysOnline) {
-    WS.prototype.send = state.originalSend;
-    log("restored WebSocket.prototype.send");
-  }
-  state.originalSend = null;
+  if (!WS || !WS.prototype || !originalWsSend) return;
+  if (WS.prototype.send && WS.prototype.send.__devtools) WS.prototype.send = originalWsSend;
+  originalWsSend = null;
 }
 
 /* ------------------------------------------------------------------ *
- * idle suppression                                                    *
+ * eval                                                                *
  * ------------------------------------------------------------------ */
 
-/** Make the client's own idle bookkeeping report "not idle, ever". */
-function patchIdleStore() {
-  if (!storage.suppressIdle) return;
-  var store = findByStoreName("IdleStore");
-  if (!store) {
-    log("IdleStore not found - relying on frame rewriting alone");
-    return;
-  }
-  var overrides = {
-    isIdle: false,
-    isAFK: false,
-    getIdleSince: 0,
-    idleSince: 0
-  };
-  Object.keys(overrides).forEach(function (key) {
-    if (typeof store[key] !== "function") return;
-    var original = store[key];
-    store[key] = function () {
-      return overrides[key];
-    };
-    state.idleUnpatchers.push(function () {
-      store[key] = original;
-    });
-    log("suppressed IdleStore." + key);
-  });
-}
-
-function unpatchIdleStore() {
-  state.idleUnpatchers.forEach(function (undo) {
-    try {
-      undo();
-    } catch (e) {
-      log("idle unpatch failed:", e);
-    }
-  });
-  state.idleUnpatchers = [];
-}
-
-/* ------------------------------------------------------------------ *
- * applying presence                                                   *
- * ------------------------------------------------------------------ */
+var lastResult = undefined;
 
 /**
- * Push the activity through Flux. This path is encoding-agnostic: Discord
- * serialises it itself, so it works on ETF connections where we cannot touch
- * the raw frames.
+ * Runs a snippet with the mod's api in scope. Tries expression form first so
+ * `1 + 1` returns 2, then falls back to a statement body for multi-line code.
  */
-function dispatchActivity() {
-  if (!FluxDispatcher || typeof FluxDispatcher.dispatch !== "function") return;
-  var activity = buildActivity();
+function runEval(source) {
+  var scope = {
+    api: api,
+    metro: api.metro,
+    find: findByProps,
+    store: findByStoreName,
+    common: common,
+    React: React,
+    ReactNative: ReactNative,
+    storage: storage,
+    $: lastResult,
+    inspect: inspect
+  };
+  var names = Object.keys(scope);
+  var values = names.map(function (n) {
+    return scope[n];
+  });
+
+  function build(body) {
+    return Function.apply(null, names.concat([body]));
+  }
+
+  var fn;
   try {
-    FluxDispatcher.dispatch({
-      type: "LOCAL_ACTIVITY_UPDATE",
-      activity: activity || {},
-      socketId: "always-online"
+    fn = build("return (" + source + "\n);");
+  } catch (e) {
+    try {
+      fn = build(source);
+    } catch (e2) {
+      return { ok: false, text: "SyntaxError: " + e2.message };
+    }
+  }
+
+  try {
+    var result = fn.apply(null, values);
+    lastResult = result;
+    return { ok: true, value: result, text: inspect(result, 4) };
+  } catch (e) {
+    // Hermes refuses Function/eval when the runtime was built without it.
+    return { ok: false, text: (e && e.name ? e.name + ": " : "") + (e && e.message ? e.message : String(e)) };
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * module registry                                                     *
+ * ------------------------------------------------------------------ */
+
+function getRegistry() {
+  var m = api.metro;
+  if (m && m.modules) return m.modules;
+  if (G.modules) return G.modules;
+  return null;
+}
+
+/** Only read already-initialized modules; forcing lazy ones can have side effects. */
+function exportsOf(entry) {
+  if (!entry || typeof entry !== "object") return undefined;
+  try {
+    if (entry.publicModule) {
+      if (entry.isInitialized === false) return undefined;
+      return entry.publicModule.exports;
+    }
+    if (entry.isInitialized === false) return undefined;
+    if (entry.exports) return entry.exports;
+  } catch (e) {}
+  return undefined;
+}
+
+function moduleLabel(exp) {
+  if (!exp) return "";
+  try {
+    if (typeof exp.getName === "function") return exp.getName();
+    if (typeof exp.name === "string" && exp.name) return exp.name;
+    if (exp.default && typeof exp.default.name === "string" && exp.default.name) return exp.default.name;
+  } catch (e) {}
+  return "";
+}
+
+function searchModules(query) {
+  var registry = getRegistry();
+  var results = [];
+  if (!registry) return { results: results, scanned: 0, available: false };
+
+  var needle = String(query || "").toLowerCase();
+  var ids = Object.keys(registry);
+  var scanned = 0;
+
+  for (var i = 0; i < ids.length && results.length < 60; i++) {
+    var id = ids[i];
+    var exp = exportsOf(registry[id]);
+    if (!exp || (typeof exp !== "object" && typeof exp !== "function")) continue;
+    scanned++;
+    if (!needle) continue;
+
+    var keys = [];
+    try {
+      keys = Object.keys(exp);
+    } catch (e) {
+      continue;
+    }
+
+    var label = moduleLabel(exp);
+    var hits = keys.filter(function (k) {
+      return k.toLowerCase().indexOf(needle) !== -1;
     });
-  } catch (e) {
-    log("LOCAL_ACTIVITY_UPDATE failed:", e);
+
+    if (hits.length || (label && label.toLowerCase().indexOf(needle) !== -1)) {
+      results.push({
+        id: id,
+        label: label,
+        keyCount: keys.length,
+        hits: hits.slice(0, 6),
+        keys: keys.slice(0, 120),
+        exports: exp
+      });
+    }
   }
+
+  return { results: results, scanned: scanned, available: true };
 }
 
-/** Send a PRESENCE_UPDATE right now, if we have a live socket. */
-function sendPresence() {
-  dispatchActivity();
+/* ------------------------------------------------------------------ *
+ * lifecycle                                                           *
+ * ------------------------------------------------------------------ */
 
-  var socket = state.socket;
-  if (!socket || socket.readyState !== 1) return false;
-  if (state.socketEncoding === "etf") return false;
-
-  try {
-    // This goes back through our own hook, which is harmless - rewriting an
-    // already-correct op 3 is a no-op.
-    socket.send(JSON.stringify({ op: 3, d: buildPresence() }));
-    state.keepalivesSent++;
-    state.lastApplied = Date.now();
-    return true;
-  } catch (e) {
-    log("presence send failed:", e);
-    return false;
-  }
-}
-
-function startTimer() {
-  stopTimer();
-  var seconds = Number(storage.keepaliveSeconds);
-  if (isNaN(seconds) || seconds < 15) seconds = 15; // op 3 is rate limited; stay polite
-  state.timer = setInterval(function () {
-    if (!storage.enabled) return;
-    sendPresence();
-  }, seconds * 1000);
-  log("keepalive every " + seconds + "s");
-}
-
-function stopTimer() {
-  if (state.timer !== null) {
-    clearInterval(state.timer);
-    state.timer = null;
-  }
-}
-
-/** Re-read settings and push them out immediately. */
-function reapply() {
-  state.activityStartedAt = Date.now();
-  startTimer();
-  var sent = sendPresence();
-  toast(sent ? "Presence applied" : "Presence queued (no live gateway yet)");
-  return sent;
-}
+var running = false;
 
 function start() {
-  if (state.running) return;
+  if (running) return;
   applyDefaults();
-  state.running = true;
-  state.activityStartedAt = Date.now();
+  patchConsole();
+  patchErrors();
+  patchNetwork();
   patchWebSocket();
-  patchIdleStore();
-  startTimer();
-  sendPresence();
-  log("started");
+  running = true;
+
+  // Reachable from the Eval tab and from other plugins: `__devtools.logs`, etc.
+  G.__devtools = {
+    logs: logs,
+    requests: requests,
+    inspect: inspect,
+    runEval: runEval,
+    searchModules: searchModules,
+    find: findByProps,
+    store: findByStoreName
+  };
+
+  pushLog("log", ["DevTools attached. Console, errors" +
+    (storage.captureNetwork ? ", network" : "") +
+    (storage.captureWebSocket ? ", websocket frames" : "") +
+    " are being captured."], "devtools");
 }
 
 function stop() {
-  if (!state.running) return;
-  stopTimer();
-  unpatchIdleStore();
+  if (!running) return;
   unpatchWebSocket();
-
-  // Drop our activity so we do not leave a ghost presence behind.
-  if (FluxDispatcher && typeof FluxDispatcher.dispatch === "function") {
-    try {
-      FluxDispatcher.dispatch({
-        type: "LOCAL_ACTIVITY_UPDATE",
-        activity: {},
-        socketId: "always-online"
-      });
-    } catch (e) {}
+  unpatchNetwork();
+  unpatchErrors();
+  unpatchConsole();
+  try {
+    delete G.__devtools;
+  } catch (e) {
+    G.__devtools = undefined;
   }
-
-  state.running = false;
-  state.socket = null;
-  log("stopped");
+  running = false;
 }
 
 /* ------------------------------------------------------------------ *
- * settings ui                                                         *
+ * ui                                                                  *
  * ------------------------------------------------------------------ */
 
 var h = React ? React.createElement : null;
+var TABS = ["Console", "Eval", "Network", "Modules", "Device"];
+var evalHistory = [];
 
 function palette(dark) {
   return dark
     ? {
-        bg: "transparent",
         card: "rgba(255,255,255,0.06)",
         border: "rgba(255,255,255,0.10)",
         text: "#f2f3f5",
@@ -509,11 +664,11 @@ function palette(dark) {
         field: "rgba(0,0,0,0.30)",
         accent: "#5865f2",
         chip: "rgba(255,255,255,0.08)",
-        good: "#3ba55d",
-        bad: "#ed4245"
+        warn: "#f0b232",
+        error: "#ed4245",
+        good: "#3ba55d"
       }
     : {
-        bg: "transparent",
         card: "rgba(0,0,0,0.04)",
         border: "rgba(0,0,0,0.10)",
         text: "#060607",
@@ -521,77 +676,100 @@ function palette(dark) {
         field: "rgba(0,0,0,0.06)",
         accent: "#5865f2",
         chip: "rgba(0,0,0,0.06)",
-        good: "#1a7f37",
-        bad: "#d1242f"
+        warn: "#a84300",
+        error: "#d1242f",
+        good: "#1a7f37"
       };
 }
 
-function SettingsPage() {
-  if (!h || !ReactNative) {
-    return null;
+function clock(ts) {
+  var d = new Date(ts);
+  function pad(n) {
+    return n < 10 ? "0" + n : String(n);
   }
+  return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+}
+
+function SettingsPage() {
+  if (!h || !ReactNative) return null;
 
   var RN = ReactNative;
   var Touchable = RN.Pressable || RN.TouchableOpacity || RN.View;
   var scheme = typeof RN.useColorScheme === "function" ? RN.useColorScheme() : "dark";
   var c = palette(scheme !== "light");
+  var mono = RN.Platform && RN.Platform.OS === "ios" ? "Menlo" : "monospace";
 
-  var tick = React.useState(0);
-  var version = tick[0];
-  var setVersion = tick[1];
+  var tabState = React.useState("Console");
+  var tab = tabState[0];
+  var setTab = tabState[1];
 
-  // Vendetta-family storage is a proxy that persists on write, so mutate it
-  // directly and force a re-render.
-  function set(key, value) {
-    storage[key] = value;
-    setVersion(version + 1);
+  var tickState = React.useState(0);
+  var setTick = tickState[1];
+
+  var filterState = React.useState("all");
+  var filter = filterState[0];
+  var setFilter = filterState[1];
+
+  var queryState = React.useState("");
+  var query = queryState[0];
+  var setQuery = queryState[1];
+
+  var expandedState = React.useState(null);
+  var expanded = expandedState[0];
+  var setExpanded = expandedState[1];
+
+  var sourceState = React.useState("");
+  var source = sourceState[0];
+  var setSource = sourceState[1];
+
+  var resultState = React.useState(null);
+  var result = resultState[0];
+  var setResult = resultState[1];
+
+  var moduleQueryState = React.useState("");
+  var moduleQuery = moduleQueryState[0];
+  var setModuleQuery = moduleQueryState[1];
+
+  var selectedModuleState = React.useState(null);
+  var selectedModule = selectedModuleState[0];
+  var setSelectedModule = selectedModuleState[1];
+
+  var selectedKeyState = React.useState(null);
+  var selectedKey = selectedKeyState[0];
+  var setSelectedKey = selectedKeyState[1];
+
+  // Live updates while the panel is open.
+  React.useEffect(function () {
+    return subscribe(function () {
+      setTick(function (t) {
+        return t + 1;
+      });
+    });
+  }, []);
+
+  function refresh() {
+    setTick(function (t) {
+      return t + 1;
+    });
   }
-  function setActivity(key, value) {
-    if (typeof storage.activity !== "object" || storage.activity === null) storage.activity = {};
-    storage.activity[key] = value;
-    setVersion(version + 1);
-  }
 
-  function Section(title, subtitle, children) {
+  /* ---- primitives ---- */
+
+  function Shell(children) {
     return h(
       RN.View,
-      { style: { marginHorizontal: 12, marginTop: 16 } },
-      h(
-        RN.Text,
-        {
-          style: {
-            color: c.dim,
-            fontSize: 12,
-            fontWeight: "700",
-            letterSpacing: 0.6,
-            textTransform: "uppercase",
-            marginBottom: 2,
-            marginLeft: 4
-          }
-        },
-        title
-      ),
-      subtitle
-        ? h(
-            RN.Text,
-            { style: { color: c.dim, fontSize: 12, marginBottom: 8, marginLeft: 4 } },
-            subtitle
-          )
-        : null,
-      h(
-        RN.View,
-        {
-          style: {
-            backgroundColor: c.card,
-            borderRadius: 14,
-            borderWidth: 1,
-            borderColor: c.border,
-            overflow: "hidden",
-            marginTop: subtitle ? 0 : 6
-          }
-        },
-        children
-      )
+      {
+        style: {
+          backgroundColor: c.card,
+          borderRadius: 14,
+          borderWidth: 1,
+          borderColor: c.border,
+          marginHorizontal: 12,
+          marginTop: 10,
+          overflow: "hidden"
+        }
+      },
+      children
     );
   }
 
@@ -599,16 +777,125 @@ function SettingsPage() {
     return h(RN.View, { style: { height: 1, backgroundColor: c.border } });
   }
 
+  function Caption(text) {
+    return h(
+      RN.Text,
+      { style: { color: c.dim, fontSize: 11, marginHorizontal: 18, marginTop: 8, lineHeight: 15 } },
+      text
+    );
+  }
+
+  function Button(label, onPress, tone) {
+    return h(
+      Touchable,
+      {
+        onPress: onPress,
+        style: {
+          flex: 1,
+          backgroundColor: tone === "quiet" ? c.chip : c.accent,
+          borderRadius: 10,
+          paddingVertical: 11,
+          alignItems: "center",
+          marginHorizontal: 4
+        }
+      },
+      h(
+        RN.Text,
+        { style: { color: tone === "quiet" ? c.text : "#ffffff", fontSize: 14, fontWeight: "700" } },
+        label
+      )
+    );
+  }
+
+  function ButtonRow(buttons) {
+    return h(
+      RN.View,
+      { style: { flexDirection: "row", paddingHorizontal: 10, paddingVertical: 10 } },
+      buttons
+    );
+  }
+
+  function Chips(options, selected, onSelect, keyPrefix) {
+    return h(
+      RN.View,
+      { style: { flexDirection: "row", flexWrap: "wrap", paddingHorizontal: 10, paddingTop: 10 } },
+      options.map(function (opt) {
+        var value = typeof opt === "string" ? opt : opt.value;
+        var label = typeof opt === "string" ? opt : opt.label;
+        var active = value === selected;
+        return h(
+          Touchable,
+          {
+            key: (keyPrefix || "") + String(value),
+            onPress: function () {
+              onSelect(value);
+            },
+            style: {
+              backgroundColor: active ? c.accent : c.chip,
+              borderRadius: 999,
+              paddingHorizontal: 13,
+              paddingVertical: 6,
+              marginRight: 7,
+              marginBottom: 8
+            }
+          },
+          h(
+            RN.Text,
+            { style: { color: active ? "#ffffff" : c.text, fontSize: 13, fontWeight: active ? "700" : "500" } },
+            label
+          )
+        );
+      })
+    );
+  }
+
+  function SearchBox(value, onChange, placeholder) {
+    return h(
+      RN.View,
+      { style: { paddingHorizontal: 10, paddingBottom: 10 } },
+      h(RN.TextInput, {
+        value: value,
+        onChangeText: onChange,
+        placeholder: placeholder,
+        placeholderTextColor: c.dim,
+        autoCapitalize: "none",
+        autoCorrect: false,
+        style: {
+          color: c.text,
+          backgroundColor: c.field,
+          borderRadius: 8,
+          paddingHorizontal: 10,
+          paddingVertical: 8,
+          fontSize: 14
+        }
+      })
+    );
+  }
+
+  function Mono(text, color) {
+    return h(
+      RN.Text,
+      {
+        selectable: true,
+        style: { color: color || c.text, fontSize: 12, fontFamily: mono, lineHeight: 17 }
+      },
+      text
+    );
+  }
+
+  function Empty(text) {
+    return h(
+      RN.Text,
+      { style: { color: c.dim, fontSize: 13, textAlign: "center", paddingVertical: 26 } },
+      text
+    );
+  }
+
   function ToggleRow(label, hint, value, onChange) {
     return h(
       RN.View,
       {
-        style: {
-          flexDirection: "row",
-          alignItems: "center",
-          paddingHorizontal: 14,
-          paddingVertical: 12
-        }
+        style: { flexDirection: "row", alignItems: "center", paddingHorizontal: 14, paddingVertical: 11 }
       },
       h(
         RN.View,
@@ -624,319 +911,701 @@ function SettingsPage() {
     );
   }
 
-  function Field(label, hint, value, onChangeText, extra) {
-    var props = {
-      value: value === undefined || value === null ? "" : String(value),
-      onChangeText: onChangeText,
-      placeholder: hint || "",
-      placeholderTextColor: c.dim,
-      autoCapitalize: "none",
-      autoCorrect: false,
-      style: {
-        color: c.text,
-        backgroundColor: c.field,
-        borderRadius: 8,
-        paddingHorizontal: 10,
-        paddingVertical: 8,
-        fontSize: 15
-      }
-    };
-    if (extra) {
-      for (var k in extra) if (Object.prototype.hasOwnProperty.call(extra, k)) props[k] = extra[k];
-    }
+  /* ---- console ---- */
+
+  function levelColor(level) {
+    if (level === "error") return c.error;
+    if (level === "warn") return c.warn;
+    if (level === "debug") return c.dim;
+    return c.good;
+  }
+
+  function ConsoleTab() {
+    var needle = query.toLowerCase();
+    var rows = logs.filter(function (entry) {
+      if (filter !== "all" && entry.level !== filter) return false;
+      if (needle && entry.summary.toLowerCase().indexOf(needle) === -1) return false;
+      return true;
+    });
+    var visible = rows.slice(-150).reverse();
+
     return h(
       RN.View,
-      { style: { paddingHorizontal: 14, paddingVertical: 10 } },
-      h(
-        RN.Text,
-        { style: { color: c.dim, fontSize: 12, fontWeight: "600", marginBottom: 6 } },
-        label
-      ),
-      h(RN.TextInput, props)
+      null,
+      Shell([
+        Chips(
+          [
+            { value: "all", label: "All " + logs.length },
+            { value: "log", label: "Log" },
+            { value: "warn", label: "Warn" },
+            { value: "error", label: "Error" },
+            { value: "debug", label: "Debug" }
+          ],
+          filter,
+          setFilter,
+          "lvl"
+        ),
+        SearchBox(query, setQuery, "Filter log text"),
+        Divider(),
+        visible.length
+          ? h(
+              RN.View,
+              null,
+              visible.map(function (entry) {
+                var open = expanded === "log" + entry.id;
+                return h(
+                  Touchable,
+                  {
+                    key: "log" + entry.id,
+                    onPress: function () {
+                      setExpanded(open ? null : "log" + entry.id);
+                    },
+                    onLongPress: function () {
+                      copy(entry.detail || entry.summary);
+                    },
+                    style: { paddingHorizontal: 12, paddingVertical: 9, borderBottomWidth: 1, borderBottomColor: c.border }
+                  },
+                  h(
+                    RN.View,
+                    { style: { flexDirection: "row", alignItems: "center", marginBottom: 3 } },
+                    h(
+                      RN.Text,
+                      { style: { color: levelColor(entry.level), fontSize: 10, fontWeight: "800", letterSpacing: 0.5 } },
+                      entry.level.toUpperCase()
+                    ),
+                    h(RN.Text, { style: { color: c.dim, fontSize: 10, marginLeft: 8 } }, clock(entry.time)),
+                    entry.source !== "app"
+                      ? h(RN.Text, { style: { color: c.dim, fontSize: 10, marginLeft: 8 } }, entry.source)
+                      : null
+                  ),
+                  h(
+                    RN.Text,
+                    {
+                      numberOfLines: open ? undefined : 3,
+                      selectable: open,
+                      style: { color: c.text, fontSize: 12, fontFamily: mono, lineHeight: 17 }
+                    },
+                    open ? entry.detail || entry.summary : entry.summary
+                  )
+                );
+              })
+            )
+          : Empty(logs.length ? "Nothing matches that filter." : "No output captured yet."),
+        ButtonRow([
+          Button("Clear", function () {
+            logs.length = 0;
+            setExpanded(null);
+            refresh();
+          }, "quiet"),
+          Button("Copy visible", function () {
+            copy(
+              visible
+                .slice()
+                .reverse()
+                .map(function (e) {
+                  return clock(e.time) + " [" + e.level + "] " + e.summary;
+                })
+                .join("\n")
+            );
+          }, "quiet")
+        ])
+      ]),
+      Caption("Tap a line to expand it, long press to copy. Newest first. Uncaught errors and native crashes land here tagged 'crash'.")
     );
   }
 
-  function Chips(options, selected, onSelect) {
+  /* ---- eval ---- */
+
+  function EvalTab() {
     return h(
       RN.View,
-      {
-        style: {
-          flexDirection: "row",
-          flexWrap: "wrap",
-          paddingHorizontal: 10,
-          paddingTop: 10,
-          paddingBottom: 4
-        }
-      },
-      options.map(function (opt) {
-        var active = opt.value === selected;
-        return h(
-          Touchable,
-          {
-            key: String(opt.value),
-            onPress: function () {
-              onSelect(opt.value);
-            },
+      null,
+      Shell([
+        h(
+          RN.View,
+          { style: { padding: 10 } },
+          h(RN.TextInput, {
+            value: source,
+            onChangeText: setSource,
+            placeholder: "find(\"getCurrentUser\").getCurrentUser()",
+            placeholderTextColor: c.dim,
+            multiline: true,
+            autoCapitalize: "none",
+            autoCorrect: false,
             style: {
-              backgroundColor: active ? c.accent : c.chip,
-              borderRadius: 999,
-              paddingHorizontal: 14,
-              paddingVertical: 7,
-              marginRight: 8,
-              marginBottom: 8
+              color: c.text,
+              backgroundColor: c.field,
+              borderRadius: 8,
+              paddingHorizontal: 10,
+              paddingVertical: 10,
+              fontSize: 13,
+              fontFamily: mono,
+              minHeight: 92,
+              textAlignVertical: "top"
             }
-          },
-          h(
-            RN.Text,
-            {
-              style: {
-                color: active ? "#ffffff" : c.text,
-                fontSize: 14,
-                fontWeight: active ? "700" : "500"
-              }
-            },
-            opt.label
-          )
-        );
-      })
-    );
-  }
-
-  function Button(label, onPress, tone) {
-    return h(
-      Touchable,
-      {
-        onPress: onPress,
-        style: {
-          backgroundColor: tone === "quiet" ? c.chip : c.accent,
-          borderRadius: 10,
-          paddingVertical: 12,
-          alignItems: "center",
-          marginHorizontal: 14,
-          marginVertical: 8
-        }
-      },
-      h(
-        RN.Text,
-        {
-          style: {
-            color: tone === "quiet" ? c.text : "#ffffff",
-            fontSize: 15,
-            fontWeight: "700"
-          }
-        },
-        label
+          })
+        ),
+        ButtonRow([
+          Button("Run", function () {
+            if (!source.trim()) return;
+            var outcome = runEval(source);
+            setResult(outcome);
+            if (evalHistory[evalHistory.length - 1] !== source) evalHistory.push(source);
+            while (evalHistory.length > 12) evalHistory.shift();
+          }),
+          Button("Clear", function () {
+            setSource("");
+            setResult(null);
+          }, "quiet")
+        ]),
+        result
+          ? h(
+              RN.View,
+              null,
+              Divider(),
+              h(
+                RN.ScrollView,
+                { style: { maxHeight: 280 }, nestedScrollEnabled: true },
+                h(
+                  RN.View,
+                  { style: { padding: 12 } },
+                  Mono(result.text, result.ok ? c.text : c.error)
+                )
+              ),
+              Divider(),
+              ButtonRow([
+                Button("Copy result", function () {
+                  copy(result.text);
+                }, "quiet")
+              ])
+            )
+          : null,
+        evalHistory.length
+          ? h(
+              RN.View,
+              null,
+              Divider(),
+              h(
+                RN.Text,
+                { style: { color: c.dim, fontSize: 11, fontWeight: "700", marginTop: 10, marginLeft: 14 } },
+                "HISTORY"
+              ),
+              h(
+                RN.View,
+                { style: { paddingBottom: 6 } },
+                evalHistory
+                  .slice()
+                  .reverse()
+                  .map(function (snippet, i) {
+                    return h(
+                      Touchable,
+                      {
+                        key: "hist" + i,
+                        onPress: function () {
+                          setSource(snippet);
+                        },
+                        style: { paddingHorizontal: 14, paddingVertical: 7 }
+                      },
+                      h(
+                        RN.Text,
+                        { numberOfLines: 1, style: { color: c.dim, fontSize: 12, fontFamily: mono } },
+                        snippet
+                      )
+                    );
+                  })
+              )
+            )
+          : null
+      ]),
+      Caption(
+        "In scope: api, metro, find(...props), store(name), common, React, ReactNative, storage, inspect(v), and $ for the previous result. " +
+          "Expressions return their value; multi-line code needs an explicit return."
       )
     );
   }
 
-  var activity = storage.activity || {};
-  var isCustom = Number(activity.type) === 4;
-  var isStreaming = Number(activity.type) === 1;
+  /* ---- network ---- */
 
-  var socketLabel = !state.socket
-    ? "not captured yet"
-    : state.socket.readyState === 1
-      ? "connected (" + state.socketEncoding + ")"
-      : "closed (" + state.socketEncoding + ")";
+  function statusColor(entry) {
+    if (entry.kind === "ws") return c.dim;
+    if (entry.outcome !== "load") return c.error;
+    if (entry.status >= 500) return c.error;
+    if (entry.status >= 400) return c.warn;
+    return c.good;
+  }
 
-  var statusLines = [
-    ["Gateway socket", socketLabel],
-    ["Identify rewrites", String(state.identifyRewrites)],
-    ["Presence rewrites", String(state.presenceRewrites)],
-    ["Keepalives sent", String(state.keepalivesSent)],
-    ["Frame hook", state.originalSend ? "active" : "inactive"],
-    ["Idle suppression", state.idleUnpatchers.length ? "active" : "not applied"],
-    [
-      "Last applied",
-      state.lastApplied ? Math.round((Date.now() - state.lastApplied) / 1000) + "s ago" : "never"
-    ]
-  ];
+  function NetworkTab() {
+    var needle = query.toLowerCase();
+    var rows = requests.filter(function (entry) {
+      if (filter === "http" && entry.kind !== "http") return false;
+      if (filter === "ws" && entry.kind !== "ws") return false;
+      if (needle && entry.url.toLowerCase().indexOf(needle) === -1) return false;
+      return true;
+    });
+    var visible = rows.slice(-150).reverse();
+
+    return h(
+      RN.View,
+      null,
+      Shell([
+        Chips(
+          [
+            { value: "all", label: "All " + requests.length },
+            { value: "http", label: "HTTP" },
+            { value: "ws", label: "WebSocket" }
+          ],
+          filter,
+          setFilter,
+          "net"
+        ),
+        SearchBox(query, setQuery, "Filter by URL"),
+        Divider(),
+        visible.length
+          ? h(
+              RN.View,
+              null,
+              visible.map(function (entry) {
+                var open = expanded === "net" + entry.id;
+                var short = entry.url.replace(/^https?:\/\//, "").replace(/^wss?:\/\//, "");
+                return h(
+                  Touchable,
+                  {
+                    key: "net" + entry.id,
+                    onPress: function () {
+                      setExpanded(open ? null : "net" + entry.id);
+                    },
+                    onLongPress: function () {
+                      copy(entry.method + " " + entry.url + "\n\n" + entry.requestBody + "\n\n" + entry.responseBody);
+                    },
+                    style: { paddingHorizontal: 12, paddingVertical: 9, borderBottomWidth: 1, borderBottomColor: c.border }
+                  },
+                  h(
+                    RN.View,
+                    { style: { flexDirection: "row", alignItems: "center", marginBottom: 3 } },
+                    h(
+                      RN.Text,
+                      { style: { color: statusColor(entry), fontSize: 10, fontWeight: "800" } },
+                      entry.kind === "ws" ? "WS" : String(entry.status || entry.outcome)
+                    ),
+                    h(RN.Text, { style: { color: c.dim, fontSize: 10, marginLeft: 8, fontWeight: "700" } }, entry.method),
+                    entry.kind === "http"
+                      ? h(RN.Text, { style: { color: c.dim, fontSize: 10, marginLeft: 8 } }, entry.ms + "ms")
+                      : null,
+                    h(RN.Text, { style: { color: c.dim, fontSize: 10, marginLeft: 8 } }, clock(entry.time))
+                  ),
+                  h(
+                    RN.Text,
+                    { numberOfLines: open ? undefined : 2, style: { color: c.text, fontSize: 12, fontFamily: mono } },
+                    short
+                  ),
+                  open
+                    ? h(
+                        RN.View,
+                        { style: { marginTop: 8 } },
+                        entry.requestBody
+                          ? h(
+                              RN.View,
+                              { style: { marginBottom: 8 } },
+                              h(RN.Text, { style: { color: c.dim, fontSize: 10, fontWeight: "700", marginBottom: 3 } }, "REQUEST"),
+                              Mono(entry.requestBody, c.dim)
+                            )
+                          : null,
+                        entry.responseHeaders
+                          ? h(
+                              RN.View,
+                              { style: { marginBottom: 8 } },
+                              h(RN.Text, { style: { color: c.dim, fontSize: 10, fontWeight: "700", marginBottom: 3 } }, "RESPONSE HEADERS"),
+                              Mono(entry.responseHeaders.trim(), c.dim)
+                            )
+                          : null,
+                        entry.responseBody
+                          ? h(
+                              RN.View,
+                              null,
+                              h(RN.Text, { style: { color: c.dim, fontSize: 10, fontWeight: "700", marginBottom: 3 } }, "RESPONSE"),
+                              Mono(entry.responseBody)
+                            )
+                          : null
+                      )
+                    : null
+                );
+              })
+            )
+          : Empty(
+              storage.captureNetwork
+                ? requests.length
+                  ? "Nothing matches that filter."
+                  : "No requests captured yet."
+                : "Network capture is off. Turn it on in Device."
+            ),
+        ButtonRow([
+          Button("Clear", function () {
+            requests.length = 0;
+            setExpanded(null);
+            refresh();
+          }, "quiet"),
+          Button("Copy visible", function () {
+            copy(
+              visible
+                .slice()
+                .reverse()
+                .map(function (e) {
+                  return (e.status || e.outcome) + " " + e.method + " " + e.url + " (" + e.ms + "ms)";
+                })
+                .join("\n")
+            );
+          }, "quiet")
+        ])
+      ]),
+      Caption(
+        "fetch() in React Native runs on XMLHttpRequest, so both show up here. Bodies are truncated to the limit set in Device. " +
+          "WebSocket capture records outgoing frames only and is off by default - the gateway is extremely chatty."
+      )
+    );
+  }
+
+  /* ---- modules ---- */
+
+  function ModulesTab() {
+    var found = searchModules(moduleQuery);
+    var selectedExports = selectedModule ? selectedModule.exports : null;
+
+    function keyDetail() {
+      if (!selectedExports || selectedKey === null) return null;
+      var value;
+      try {
+        value = selectedExports[selectedKey];
+      } catch (e) {
+        return "[reading this key throws: " + e.message + "]";
+      }
+      if (typeof value === "function") {
+        var src;
+        try {
+          src = String(value);
+        } catch (e) {
+          src = "[unavailable]";
+        }
+        return describeFunction(value) + "\n\n" + src;
+      }
+      return inspect(value, 4);
+    }
+
+    return h(
+      RN.View,
+      null,
+      Shell([
+        SearchBox(moduleQuery, function (text) {
+          setModuleQuery(text);
+          setSelectedModule(null);
+          setSelectedKey(null);
+        }, "Search exports, e.g. getCurrentUser"),
+        Divider(),
+        !found.available
+          ? Empty("No module registry exposed by this mod build.")
+          : !moduleQuery
+            ? Empty("Scanned " + found.scanned + " initialized modules. Type to search.")
+            : !found.results.length
+              ? Empty("Nothing in " + found.scanned + " initialized modules exports that.")
+              : h(
+                  RN.View,
+                  null,
+                  found.results.map(function (mod) {
+                    var open = selectedModule && selectedModule.id === mod.id;
+                    return h(
+                      RN.View,
+                      { key: "mod" + mod.id },
+                      h(
+                        Touchable,
+                        {
+                          onPress: function () {
+                            setSelectedModule(open ? null : mod);
+                            setSelectedKey(null);
+                          },
+                          style: { paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: c.border }
+                        },
+                        h(
+                          RN.View,
+                          { style: { flexDirection: "row", alignItems: "center" } },
+                          h(RN.Text, { style: { color: c.accent, fontSize: 12, fontWeight: "800" } }, "#" + mod.id),
+                          mod.label
+                            ? h(RN.Text, { style: { color: c.text, fontSize: 12, marginLeft: 8, fontWeight: "600" } }, mod.label)
+                            : null,
+                          h(RN.Text, { style: { color: c.dim, fontSize: 11, marginLeft: 8 } }, mod.keyCount + " exports")
+                        ),
+                        mod.hits.length
+                          ? h(
+                              RN.Text,
+                              { numberOfLines: 1, style: { color: c.dim, fontSize: 11, fontFamily: mono, marginTop: 3 } },
+                              mod.hits.join(", ")
+                            )
+                          : null
+                      ),
+                      open
+                        ? h(
+                            RN.View,
+                            { style: { backgroundColor: c.field, paddingBottom: 8 } },
+                            Chips(
+                              mod.keys.map(function (k) {
+                                return { value: k, label: k };
+                              }),
+                              selectedKey,
+                              setSelectedKey,
+                              "key" + mod.id
+                            ),
+                            selectedKey !== null
+                              ? h(
+                                  RN.ScrollView,
+                                  { style: { maxHeight: 240 }, nestedScrollEnabled: true },
+                                  h(RN.View, { style: { paddingHorizontal: 12, paddingVertical: 8 } }, Mono(keyDetail()))
+                                )
+                              : null,
+                            selectedKey !== null
+                              ? ButtonRow([
+                                  Button("Copy value", function () {
+                                    copy(keyDetail());
+                                  }, "quiet")
+                                ])
+                              : null
+                          )
+                        : null
+                    );
+                  })
+                )
+      ]),
+      Caption(
+        "Only already-initialized modules are read, because forcing a lazy one can run its side effects. " +
+          "Function bodies read as [bytecode]: Discord ships Hermes bytecode, and the original source is not in the app to recover."
+      )
+    );
+  }
+
+  /* ---- device ---- */
+
+  function DeviceTab() {
+    var info = [];
+
+    function add(label, value) {
+      if (value === undefined || value === null || value === "") return;
+      info.push([label, String(value)]);
+    }
+
+    try {
+      var debug = api.debug || {};
+      var versions = debug.versions || {};
+      add("Discord", versions.discord || (debug.getDebugInfo && debug.getDebugInfo().discord));
+      add("React", versions.react || (React && React.version));
+      add("React Native", versions.reactNative);
+      add("Mod", (api.version || (api.debug && api.debug.version)) || "");
+    } catch (e) {}
+
+    try {
+      if (RN.Platform) {
+        add("Platform", RN.Platform.OS + (RN.Platform.Version ? " " + RN.Platform.Version : ""));
+        if (RN.Platform.constants) {
+          add("Device", RN.Platform.constants.Model || RN.Platform.constants.Brand);
+          add("System", RN.Platform.constants.systemName);
+        }
+      }
+      if (RN.Dimensions) {
+        var win = RN.Dimensions.get("window");
+        add("Window", Math.round(win.width) + " x " + Math.round(win.height) + " @" + win.scale + "x");
+      }
+    } catch (e) {}
+
+    try {
+      if (G.HermesInternal && typeof G.HermesInternal.getRuntimeProperties === "function") {
+        var props = G.HermesInternal.getRuntimeProperties();
+        add("Hermes", props["OSS Release Version"] || props.Build || "yes");
+        add("Bytecode version", props["Bytecode Version"]);
+      } else {
+        add("Engine", "JSC (no Hermes)");
+      }
+    } catch (e) {}
+
+    add("Captured logs", logs.length);
+    add("Captured requests", requests.length);
+
+    return h(
+      RN.View,
+      null,
+      Shell([
+        h(
+          RN.View,
+          { style: { paddingHorizontal: 14, paddingVertical: 12 } },
+          info.length
+            ? info.map(function (row) {
+                return h(
+                  RN.View,
+                  { key: row[0], style: { flexDirection: "row", justifyContent: "space-between", paddingVertical: 3 } },
+                  h(RN.Text, { style: { color: c.dim, fontSize: 13 } }, row[0]),
+                  h(RN.Text, { style: { color: c.text, fontSize: 13, fontWeight: "600", flexShrink: 1, textAlign: "right" } }, row[1])
+                );
+              })
+            : Empty("No build info exposed.")
+        ),
+        Divider(),
+        ButtonRow([
+          Button("Copy info", function () {
+            copy(
+              info
+                .map(function (r) {
+                  return r[0] + ": " + r[1];
+                })
+                .join("\n")
+            );
+          }, "quiet")
+        ])
+      ]),
+
+      Shell([
+        h(
+          RN.Text,
+          { style: { color: c.dim, fontSize: 11, fontWeight: "700", margin: 14, marginBottom: 4 } },
+          "REACT DEVTOOLS"
+        ),
+        h(
+          RN.View,
+          { style: { paddingHorizontal: 14, paddingBottom: 4 } },
+          h(RN.TextInput, {
+            value: storage.devtoolsHost || "",
+            onChangeText: function (text) {
+              storage.devtoolsHost = text;
+              refresh();
+            },
+            placeholder: "192.168.1.20:8097",
+            placeholderTextColor: c.dim,
+            autoCapitalize: "none",
+            autoCorrect: false,
+            style: {
+              color: c.text,
+              backgroundColor: c.field,
+              borderRadius: 8,
+              paddingHorizontal: 10,
+              paddingVertical: 8,
+              fontSize: 14,
+              fontFamily: mono
+            }
+          })
+        ),
+        ButtonRow([
+          Button("Connect", function () {
+            var host = String(storage.devtoolsHost || "").trim();
+            if (!host) return toast("Enter host:port first");
+            var url = host.indexOf("://") === -1 ? "ws://" + host : host;
+            var connect =
+              (api.debug && api.debug.connectToDebugger) ||
+              (api.debug && api.debug.connectToDevTools) ||
+              null;
+            if (typeof connect !== "function") {
+              toast("This mod build exposes no devtools bridge");
+              pushLog("warn", ["No connectToDebugger on api.debug; keys: " + Object.keys(api.debug || {}).join(", ")], "devtools");
+              return;
+            }
+            try {
+              connect(url);
+              toast("Connecting to " + url);
+              pushLog("log", ["React DevTools -> " + url], "devtools");
+            } catch (e) {
+              toast("Connect failed");
+              pushLog("error", ["connectToDebugger failed", e], "devtools");
+            }
+          })
+        ]),
+        Caption(
+          "Run `npx react-devtools` on your Mac, put its LAN address here, and you get the real component tree with props and state - " +
+            "the closest thing to Safari's element inspector for a React Native app."
+        ),
+        h(RN.View, { style: { height: 10 } })
+      ]),
+
+      Shell([
+        ToggleRow("Capture console", "console.log / warn / error", storage.captureConsole, function (v) {
+          storage.captureConsole = v;
+          if (v) patchConsole();
+          else unpatchConsole();
+          refresh();
+        }),
+        Divider(),
+        ToggleRow("Capture uncaught errors", "Global handler, including fatals", storage.captureErrors, function (v) {
+          storage.captureErrors = v;
+          if (v) patchErrors();
+          else unpatchErrors();
+          refresh();
+        }),
+        Divider(),
+        ToggleRow("Capture network", "HTTP via XMLHttpRequest and fetch", storage.captureNetwork, function (v) {
+          storage.captureNetwork = v;
+          if (v) patchNetwork();
+          else unpatchNetwork();
+          refresh();
+        }),
+        Divider(),
+        ToggleRow("Capture websocket frames", "Outgoing only, very noisy", storage.captureWebSocket, function (v) {
+          storage.captureWebSocket = v;
+          if (v) patchWebSocket();
+          else unpatchWebSocket();
+          refresh();
+        }),
+        Divider(),
+        h(
+          RN.View,
+          { style: { paddingHorizontal: 14, paddingVertical: 10 } },
+          h(RN.Text, { style: { color: c.dim, fontSize: 12, fontWeight: "600", marginBottom: 6 } }, "Buffer size (entries)"),
+          h(RN.TextInput, {
+            value: String(storage.maxEntries),
+            onChangeText: function (text) {
+              var digits = text.replace(/[^0-9]/g, "");
+              storage.maxEntries = digits === "" ? "" : Number(digits);
+              refresh();
+            },
+            keyboardType: "number-pad",
+            placeholderTextColor: c.dim,
+            style: {
+              color: c.text,
+              backgroundColor: c.field,
+              borderRadius: 8,
+              paddingHorizontal: 10,
+              paddingVertical: 8,
+              fontSize: 14
+            }
+          })
+        )
+      ])
+    );
+  }
+
+  /* ---- shell ---- */
+
+  var body =
+    tab === "Console"
+      ? ConsoleTab()
+      : tab === "Eval"
+        ? EvalTab()
+        : tab === "Network"
+          ? NetworkTab()
+          : tab === "Modules"
+            ? ModulesTab()
+            : DeviceTab();
 
   return h(
     RN.ScrollView,
-    { style: { flex: 1 }, contentContainerStyle: { paddingBottom: 48, paddingTop: 4 } },
-
-    Section(
-      "Keep online",
-      "Rewrites outgoing gateway frames so the client never reports idle, afk or offline.",
-      [
-        ToggleRow("Enabled", "Master switch for all rewriting", storage.enabled, function (v) {
-          set("enabled", v);
-          if (v) reapply();
-        }),
-        Divider(),
-        ToggleRow(
-          "Suppress idle detection",
-          "Also stops the UI from flipping you to idle locally",
-          storage.suppressIdle,
-          function (v) {
-            set("suppressIdle", v);
-            toast("Reload the app to change idle patching");
-          }
-        ),
-        Divider(),
-        ToggleRow(
-          "Appear as desktop",
-          "Drops the mobile indicator by editing the identify handshake",
-          storage.spoofDesktop,
-          function (v) {
-            set("spoofDesktop", v);
-            toast("Applies on the next gateway connection");
-          }
-        ),
-        Divider(),
-        Field("Re-assert every (seconds)", "60", storage.keepaliveSeconds, function (text) {
-          var digits = text.replace(/[^0-9]/g, "");
-          set("keepaliveSeconds", digits === "" ? "" : Number(digits));
-        }, { keyboardType: "number-pad" })
-      ]
-    ),
-
-    Section("Status", null, [
-      Chips(
-        STATUSES.map(function (s) {
-          return { value: s, label: s === "dnd" ? "Do Not Disturb" : s[0].toUpperCase() + s.slice(1) };
-        }),
-        storage.status,
-        function (v) {
-          set("status", v);
-          sendPresence();
-        }
-      )
-    ]),
-
-    Section("Custom presence", "Pushed over the gateway and through Flux, so it survives both encodings.", [
-      ToggleRow("Enabled", null, activity.enabled, function (v) {
-        setActivity("enabled", v);
-        reapply();
-      }),
-      Divider(),
-      Chips(ACTIVITY_TYPES, Number(activity.type), function (v) {
-        setActivity("type", v);
-        reapply();
-      }),
-      Divider(),
-      isCustom
-        ? Field("Status text", "vibing", activity.state, function (t) {
-            setActivity("state", t);
-          })
-        : h(
-            RN.View,
-            null,
-            Field("Name", "Minecraft", activity.name, function (t) {
-              setActivity("name", t);
-            }),
-            Divider(),
-            Field("Details (first line)", "In a world", activity.details, function (t) {
-              setActivity("details", t);
-            }),
-            Divider(),
-            Field("State (second line)", "Mining", activity.state, function (t) {
-              setActivity("state", t);
-            }),
-            isStreaming ? Divider() : null,
-            isStreaming
-              ? Field("Stream URL", "https://twitch.tv/...", activity.url, function (t) {
-                  setActivity("url", t);
-                })
-              : null,
-            Divider(),
-            ToggleRow("Show elapsed time", "Adds a ticking timer", activity.showElapsed, function (v) {
-              setActivity("showElapsed", v);
-              reapply();
-            })
-          ),
-      Divider(),
-      Button("Apply now", function () {
-        reapply();
-      })
-    ]),
-
-    isCustom
-      ? null
-      : Section("Images", "Asset keys are resolved against the application id, so set both.", [
-          Field("Application ID", "1234567890", activity.applicationId, function (t) {
-            setActivity("applicationId", t.replace(/[^0-9]/g, ""));
-          }, { keyboardType: "number-pad" }),
-          Divider(),
-          Field("Large image key", "big_icon", activity.largeImage, function (t) {
-            setActivity("largeImage", t);
-          }),
-          Divider(),
-          Field("Large image tooltip", "", activity.largeText, function (t) {
-            setActivity("largeText", t);
-          }),
-          Divider(),
-          Field("Small image key", "small_icon", activity.smallImage, function (t) {
-            setActivity("smallImage", t);
-          }),
-          Divider(),
-          Field("Small image tooltip", "", activity.smallText, function (t) {
-            setActivity("smallText", t);
-          })
-        ]),
-
-    Section("Diagnostics", null, [
-      h(
-        RN.View,
-        { style: { paddingHorizontal: 14, paddingVertical: 12 } },
-        statusLines.map(function (row, i) {
-          return h(
-            RN.View,
-            {
-              key: row[0],
-              style: {
-                flexDirection: "row",
-                justifyContent: "space-between",
-                paddingVertical: 3
-              }
-            },
-            h(RN.Text, { style: { color: c.dim, fontSize: 13 } }, row[0]),
-            h(
-              RN.Text,
-              { style: { color: c.text, fontSize: 13, fontWeight: "600" } },
-              row[1]
-            )
-          );
-        })
-      ),
-      Divider(),
-      Button("Refresh", function () {
-        setVersion(version + 1);
-      }, "quiet"),
-      Button("Copy debug log", function () {
-        var text = debugLines.join("\n");
-        try {
-          var clipboard = common.clipboard || findByProps("setString", "getString");
-          if (clipboard && clipboard.setString) {
-            clipboard.setString(text);
-            toast("Debug log copied");
-          } else {
-            log("no clipboard module available");
-            toast("No clipboard module");
-          }
-        } catch (e) {
-          toast("Copy failed");
-        }
-      }, "quiet")
-    ]),
-
+    { style: { flex: 1 }, contentContainerStyle: { paddingBottom: 60 }, keyboardShouldPersistTaps: "handled" },
     h(
-      RN.Text,
-      {
-        style: {
-          color: c.dim,
-          fontSize: 11,
-          lineHeight: 16,
-          marginHorizontal: 18,
-          marginTop: 18
-        }
-      },
-      "Your status lives on the gateway websocket, which dies when the OS suspends Discord. " +
-        "This keeps you online for as long as the app process survives and puts you back online " +
-        "the instant it reconnects. For literal 24/7, run a gateway client on a machine that never sleeps."
-    )
+      RN.View,
+      { style: { paddingTop: 8 } },
+      Chips(
+        TABS,
+        tab,
+        function (value) {
+          setTab(value);
+          setExpanded(null);
+          setFilter("all");
+          setQuery("");
+        },
+        "tab"
+      )
+    ),
+    body
   );
 }
 
@@ -948,16 +1617,14 @@ function onLoad() {
   try {
     start();
   } catch (e) {
-    log("onLoad failed:", e);
+    if (originalConsole.error) originalConsole.error("[devtools] onLoad failed", e);
   }
 }
 
 function onUnload() {
   try {
     stop();
-  } catch (e) {
-    log("onUnload failed:", e);
-  }
+  } catch (e) {}
 }
 
 var plugin = {
