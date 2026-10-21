@@ -71,6 +71,19 @@
       <p class="sub">Paste a folder URL into Kettu &rarr; Settings &rarr; Plugins &rarr; +</p>
 
       <div class="plugin">
+        <h2>Toolbox</h2>
+        <p>
+          Copy embed contents, read text attachments in-app, copy IDs, links, code blocks,
+          sticker and emoji URLs. Silent typing and an archive of deletes and edits.
+          Every feature has its own switch.
+        </p>
+        <div class="url">
+          <code id="toolbox-url"></code>
+          <button type="button" data-copy="toolbox-url">Copy</button>
+        </div>
+      </div>
+
+      <div class="plugin">
         <h2>DevTools</h2>
         <p>
           Web-inspector style debugging panel: console capture, an eval REPL, a network log,
@@ -90,6 +103,7 @@
     <script>
       // Works whether this is served from Pages or opened from a local build.
       const base = location.origin + location.pathname.replace(/index\.html$/, "");
+      document.getElementById("toolbox-url").textContent = base + "Toolbox/";
       document.getElementById("devtools-url").textContent = base + "DevTools/";
 
       document.querySelectorAll("button[data-copy]").forEach((button) => {

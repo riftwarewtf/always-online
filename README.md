@@ -9,16 +9,99 @@ Kettu takes a **folder URL** and appends `manifest.json` itself. A `github.com/.
 Once Pages is enabled on this repo (Settings → Pages → Deploy from a branch → `main` → `/ (root)`):
 
 ```
+https://riftwarewtf.github.io/always-online/Toolbox/
 https://riftwarewtf.github.io/always-online/DevTools/
 ```
 
 Works right now without Pages, same thing:
 
 ```
+https://raw.githubusercontent.com/riftwarewtf/always-online/main/Toolbox/
 https://raw.githubusercontent.com/riftwarewtf/always-online/main/DevTools/
 ```
 
 Trailing slash matters.
+
+---
+
+## Toolbox
+
+A message toolkit where every feature is a switch. Long press a message and the
+rows appear at the bottom of Discord's own sheet; turn off the ones you do not
+want and they are gone from the menu.
+
+| Row | What it does |
+| --- | --- |
+| **Copy embed content** | Flattens every embed on the message into text — author, title, link, description, every field as `name: value`, footer and timestamp. The one iOS never got. |
+| **View embed content** | Same text, in a scrollable viewer first. |
+| **Preview file contents** | Reads a text attachment in-app. The CDN is asked for a byte range, so peeking at a 40 MB log costs 200 KB. Several text files on one message get a picker. |
+| **Copy file URL** | Every attachment URL, one per line. |
+| **Copy message text** | The raw markdown as it was typed, not the rendered version. |
+| **Copy code blocks** | Code only, fences and language tag stripped. Falls back to inline `` `code` `` spans. |
+| **Copy message JSON** | The whole message object, depth-safe and cycle-safe. Off by default. |
+| **View message JSON** | Same, in the viewer. |
+| **Copy IDs** | Message, channel, server and author in one block. |
+| **Copy message link** | `discord.com/channels/…`, with the guild id read out of ChannelStore. |
+| **Copy avatar URL** | Full size, `.gif` when the user's avatar is animated. Off by default. |
+| **Copy sticker / emoji URL** | Stickers plus every custom emoji in the message text. |
+| **Copy timestamp** | Exact send time, local and ISO, plus a `<t:…:f>` tag. Off by default. |
+
+Recognising a text file goes by content type first and extension second, across
+about sixty of them — logs, configs, source, diffs, subtitles, csv.
+
+### Three ways to reach the same actions
+
+Patching Discord's action sheet is the part most likely to break on a client
+update, so none of it is the only path:
+
+1. **Long-press rows** — the normal way.
+2. **Settings → Grab** — lists the last 30 messages in the channel you have
+   open, read straight out of MessageStore, and offers the same actions. No
+   patches involved at all, so it still works when the rows do not.
+3. **`/embed` and `/preview`** — act on the newest message in the channel that
+   has an embed or a text attachment.
+
+### Extras
+
+**Silent typing** stops the typing indicator from ever being sent. Off by default.
+
+**Archive** keeps what you saw before it disappeared. Deletes and edits are read
+out of the store from a `before` hook on the dispatcher — the one moment the old
+body still exists — and kept in memory, searchable, filterable, copyable, 200
+entries by default. Nothing is sent anywhere and the list clears on restart.
+`MESSAGE_UPDATE` also fires when an embed resolves, which is not an edit, so
+entries are only made when the text actually changed.
+
+### Where things render
+
+Previews and JSON dumps open in a modal mounted above the whole app, by wrapping
+`ErrorBoundary.prototype.render` — the same mount point Kettu uses to take the
+screen over on a crash, and the one component reliably above an action sheet.
+Discord instantiates more than one boundary, so the host elects a single owner
+and the others render `null`. With the viewer switched off, previews fall back to
+the clipboard, and the settings page hosts its own copy of the modal so the Grab
+tab still shows them.
+
+The rows draw themselves by default rather than using Discord's `FormRow`: a
+wrong prop on an internal component takes the whole long-press menu down, and
+these have no way to be tested against a real client from here. **Native row
+style** in settings switches to `FormRow` if you prefer the exact native look.
+
+### If the rows do not show up
+
+**Status** reports every lookup and every patch by name: whether settings are
+persistent, whether the sheet hook is armed, which injection strategy it used
+(`row list` or the `wrapped tree` fallback), and which modules resolved. The
+sheet line only fills in after the first long press, because that is when
+Discord loads the sheet module. Alongside DevTools, `[toolbox]` lines show up in
+its Console tab, and `__toolbox.state()` works from its Eval tab.
+
+```js
+__toolbox.state()                    // every patch and its state
+__toolbox.archive                    // deletes and edits captured so far
+__toolbox.newest((c) => c.message.embeds.length > 0)
+__toolbox.embedText(message, true)
+```
 
 ---
 
@@ -82,8 +165,10 @@ __devtools.inspect(value)
 No dependencies, Node 18+ (or Bun):
 
 ```sh
-node build.mjs          # writes DevTools/index.js and DevTools/manifest.json
-node test/smoke.mjs     # fake RN runtime: capture, eval, module search, all five tabs render
+node build.mjs             # builds every plugin in plugins/ to its own folder
+node build.mjs Toolbox     # just one
+node test/devtools.mjs     # fake RN runtime: capture, eval, module search, all five tabs render
+node test/toolbox.mjs      # fake action sheet, dispatcher, CDN: rows, embed text, preview, archive
 ```
 
 `manifest.json` carries a `hash`, the sha256 of the bundle. Kettu only refetches plugin code when that hash changes, so the build recomputes it every time — commit the built folder or installs serve stale code.
@@ -91,7 +176,7 @@ node test/smoke.mjs     # fake RN runtime: capture, eval, module search, all fiv
 For live development Kettu can load from a local HTTP server:
 
 ```sh
-node build.mjs --serve --watch --port=4040
+node build.mjs Toolbox --serve --watch --port=4040
 ```
 
 Then install `http://<your-lan-ip>:4040/` and it rebuilds on every save.
@@ -118,14 +203,15 @@ Two consequences, and both of them bite silently:
 ## Layout
 
 ```
-src/index.js       the plugin, one self-contained file, no imports
-manifest.json      source of truth for name/version/author
-build.mjs          wraps src into DevTools/, stamps the hash, optional dev server
-test/smoke.mjs     fake React Native runtime and fake Kettu api
-DevTools/          what Kettu installs - committed on purpose, this is what Pages serves
-index.html         landing page listing the plugins and their install URLs
+plugins/<Name>/index.js       the plugin, one self-contained file, no imports
+plugins/<Name>/manifest.json  source of truth for name/version/author
+build.mjs                     wraps each one into <Name>/, stamps the hash, optional dev server
+test/devtools.mjs             fake React Native runtime and fake Kettu api
+test/toolbox.mjs              same, plus a fake action sheet, dispatcher and CDN
+DevTools/  Toolbox/           what Kettu installs - committed on purpose, this is what Pages serves
+index.html                    landing page listing the plugins and their install URLs
 ```
 
-`src/index.js` imports nothing. It takes the per-plugin API from its enclosing scope when there is one and falls back to the globals, tries both the old `findByProps` and the newer `filters.byProps` + `findExports` shapes, finds the patcher at `patcher` (Vendetta) or `api.patcher` (Bunny), and degrades to a message in the UI when a lookup misses rather than throwing. That is why there is no bundler here and why one file works across all three mods.
+Each `plugins/<Name>/index.js` imports nothing. It takes the per-plugin API from its enclosing scope when there is one and falls back to the globals, tries both the old `findByProps` and the newer `filters.byProps` + `findExports` shapes, finds the patcher at `patcher` (Vendetta) or `api.patcher` (Bunny), and degrades to a message in the UI when a lookup misses rather than throwing. That is why there is no bundler here and why one file works across all three mods.
 
-Adding a second plugin means a second source file and a second output folder, each with its own manifest and install URL — the folders are independent.
+Adding another plugin means another folder under `plugins/`; the build picks it up, gives it its own output folder, manifest and install URL, and the folders stay independent.

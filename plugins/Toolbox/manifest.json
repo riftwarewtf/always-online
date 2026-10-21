@@ -1,0 +1,17 @@
+{
+  "name": "Toolbox",
+  "description": "A configurable message toolkit: copy embed contents, read text attachments in-app, copy IDs, links, code blocks, sticker and emoji URLs, silent typing, and an archive of deletes and edits. Every feature has its own switch.",
+  "version": "1.0.0",
+  "authors": [
+    {
+      "name": "Larpbase"
+    }
+  ],
+  "main": "index.js",
+  "vendetta": {
+    "icon": "ic_copy_message_link"
+  },
+  "bunny": {
+    "icon": "ic_copy_message_link"
+  }
+}
