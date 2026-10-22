@@ -1,7 +1,7 @@
 {
   "name": "Toolbox",
-  "description": "A configurable message toolkit: copy embed contents, expand text attachments inline with Discord's own arrow, copy IDs, links, code blocks, sticker and emoji URLs. Keeps deleted messages in the chat and the text from before an edit. Every feature has its own switch.",
-  "version": "1.1.0",
+  "description": "A configurable message toolkit: copy embed contents, expand text attachments inline with Discord's own arrow, copy IDs, links, code blocks, sticker and emoji URLs, and keep the text from before an edit. Every feature has its own switch.",
+  "version": "1.2.0",
   "authors": [
     {
       "name": "Larpbase"
@@ -14,5 +14,5 @@
   "bunny": {
     "icon": "ic_copy_message_link"
   },
-  "hash": "1305d9d60ad749d6fea3257f59052b6b102422466705dc4157f809a06c0df774"
+  "hash": "ac2e561c3c75c766e295dc36207cc3548ca26c0326bff426461ea3f02bc78ffb"
 }
