@@ -10,6 +10,7 @@ Once Pages is enabled on this repo (Settings → Pages → Deploy from a branch 
 
 ```
 https://riftwarewtf.github.io/always-online/Toolbox/
+https://riftwarewtf.github.io/always-online/ServerDetails/
 https://riftwarewtf.github.io/always-online/DevTools/
 ```
 
@@ -17,6 +18,7 @@ Works right now without Pages, same thing:
 
 ```
 https://raw.githubusercontent.com/riftwarewtf/always-online/main/Toolbox/
+https://raw.githubusercontent.com/riftwarewtf/always-online/main/ServerDetails/
 https://raw.githubusercontent.com/riftwarewtf/always-online/main/DevTools/
 ```
 
@@ -155,6 +157,67 @@ __toolbox.embedText(message, true)
 
 ---
 
+## ServerDetails
+
+A port of [DevilBro's ServerDetails](https://github.com/mwittrien/BetterDiscordAddons/tree/master/Plugins/ServerDetails/)
+for BetterDiscord, which puts a server's details in the server list tooltip.
+
+A phone has no hover and no shift key, so the trigger is the gesture that means
+the same thing: **long press a server** and *Server details* appears in its
+sheet. Tap it and the panel opens with the same items the original shows, each
+with its own switch:
+
+| Item | |
+| --- | --- |
+| **Icon** | Full size, `.gif` when the server's icon is animated, the server's acronym when it has none. |
+| **Server owner** | Display name and username. Not in the cache? The profile is requested once and the panel fills itself in rather than showing a blank. |
+| **Creation date** | Out of the server's own snowflake. |
+| **Join date** | From the guild record, parsed whether it arrives as a string, a number or a moment-like object. |
+| **Members** | From MemberCountStore, grouped — `12,345`. |
+| **Channels** | Categories are not counted as channels, same as the original. Falls back to counting ChannelStore when the per-guild store is cold. |
+| **Roles** | Everyone's own role shares the server's id and is not counted. |
+| **Boosts** | `premiumSubscriberCount`, `0` rather than blank. |
+| **Language** | The locale spelled out — `English, US (en-US)` — from a table, then `Intl.DisplayNames`, then the raw code. |
+
+Switched off by default, because the original has no equivalent: **server ID**,
+**vanity invite**, **boost tier**, **verification level** and **description**.
+
+Dates are local, with the age beside them (`2015-05-01 14:20 (11y 4m ago)`);
+**Relative ages** turns that off. **Copy** in the panel writes every visible row
+out as text.
+
+### What did not come across
+
+Tooltip **width**, **delay**, **colour**, **show only on shift** and the date
+format builder are desktop-only ideas — there is no tooltip to size or delay,
+and no shift key to hold — so they are not here. The panel is a sheet-sized
+modal instead, and long press is already a deliberate gesture, which is what
+show-on-shift was for.
+
+This is a reimplementation rather than a copy: BetterDiscord plugins run against
+BDFDB and the desktop DOM, and neither exists in this runtime.
+
+### Reaching it without the gesture
+
+**Settings → Servers** lists every server you are in with a one-line summary,
+and opens the same panel for any of them. It reads the stores directly and
+patches nothing, so it works even if the sheet row does not.
+
+The row goes into any sheet whose key mentions a guild, because the exact name
+moves between builds; **Status** reports which key it matched, whether the row
+is Discord's own component or one drawn here (there is the same class error
+boundary as in Toolbox, so a wrong prop on Discord's component cannot take the
+sheet down), and which stores resolved.
+
+```js
+__serverdetails.rows(guildId)        // [{label, value}] for the enabled items
+__serverdetails.report(guildId)      // the same thing as copyable text
+__serverdetails.open(guildId)        // open the panel
+__serverdetails.state()
+```
+
+---
+
 ## DevTools
 
 A debugging panel in the shape of Safari's Web Inspector, five tabs deep. Capture starts when the plugin loads and keeps running whether or not the panel is open, so you can trigger a bug and then go look at what happened.
@@ -219,6 +282,7 @@ node build.mjs             # builds every plugin in plugins/ to its own folder
 node build.mjs Toolbox     # just one
 node test/devtools.mjs     # fake RN runtime: capture, eval, module search, all five tabs render
 node test/toolbox.mjs      # fake sheet, jsx runtime, RowManager, CDN: icons, rows, embeds, files, edits
+node test/serverdetails.mjs  # fake guild stores: every item, uncached owner, sheet row, panel
 ```
 
 `manifest.json` carries a `hash`, the sha256 of the bundle. Kettu only refetches plugin code when that hash changes, so the build recomputes it every time — commit the built folder or installs serve stale code.
@@ -258,7 +322,7 @@ plugins/<Name>/manifest.json  source of truth for name/version/author
 build.mjs                     wraps each one into <Name>/, stamps the hash, optional dev server
 test/devtools.mjs             fake React Native runtime and fake Kettu api
 test/toolbox.mjs              same, plus a fake action sheet, dispatcher and CDN
-DevTools/  Toolbox/           what Kettu installs - committed on purpose, this is what Pages serves
+DevTools/  Toolbox/  ServerDetails/   what Kettu installs - committed on purpose, this is what Pages serves
 index.html                    landing page listing the plugins and their install URLs
 ```
 

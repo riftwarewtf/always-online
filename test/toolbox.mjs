@@ -58,7 +58,14 @@ const React = {
   version: "18.2.0",
   Fragment: "Fragment",
   Component,
-  createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+  // Shaped like the real one: children arrive as variadic arguments and end up
+  // on props too, which is where a class component reads them from.
+  createElement: (type, props, ...children) => {
+    const merged = { ...(props ?? {}) };
+    if (children.length === 1) merged.children = children[0];
+    else if (children.length > 1) merged.children = children;
+    return { type, props: merged, children };
+  },
   useState: (initial) => {
     const index = hookIndex++;
     const value = Object.prototype.hasOwnProperty.call(hookValues, index) ? hookValues[index] : initial;

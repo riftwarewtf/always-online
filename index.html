@@ -84,6 +84,19 @@
       </div>
 
       <div class="plugin">
+        <h2>ServerDetails</h2>
+        <p>
+          Long press a server for its details: icon, owner, creation and join dates,
+          members, channels, roles, boosts and language. Every item has its own switch.
+          After DevilBro's BetterDiscord plugin of the same name.
+        </p>
+        <div class="url">
+          <code id="serverdetails-url"></code>
+          <button type="button" data-copy="serverdetails-url">Copy</button>
+        </div>
+      </div>
+
+      <div class="plugin">
         <h2>DevTools</h2>
         <p>
           Web-inspector style debugging panel: console capture, an eval REPL, a network log,
@@ -104,6 +117,7 @@
       // Works whether this is served from Pages or opened from a local build.
       const base = location.origin + location.pathname.replace(/index\.html$/, "");
       document.getElementById("toolbox-url").textContent = base + "Toolbox/";
+      document.getElementById("serverdetails-url").textContent = base + "ServerDetails/";
       document.getElementById("devtools-url").textContent = base + "DevTools/";
 
       document.querySelectorAll("button[data-copy]").forEach((button) => {

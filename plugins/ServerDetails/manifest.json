@@ -1,0 +1,20 @@
+{
+  "name": "ServerDetails",
+  "description": "Long press a server for its details: icon, owner, creation and join dates, members, channels, roles, boosts and language. Every item has its own switch. After DevilBro's BetterDiscord plugin of the same name.",
+  "version": "1.0.0",
+  "authors": [
+    {
+      "name": "Larpbase"
+    },
+    {
+      "name": "DevilBro (original BetterDiscord plugin)"
+    }
+  ],
+  "main": "index.js",
+  "vendetta": {
+    "icon": "ic_info_24px"
+  },
+  "bunny": {
+    "icon": "ic_info_24px"
+  }
+}
