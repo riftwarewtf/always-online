@@ -163,9 +163,10 @@ A port of [DevilBro's ServerDetails](https://github.com/mwittrien/BetterDiscordA
 for BetterDiscord, which puts a server's details in the server list tooltip.
 
 A phone has no hover and no shift key, so the trigger is the gesture that means
-the same thing: **long press a server** and *Server details* appears in its
-sheet. Tap it and the panel opens with the same items the original shows, each
-with its own switch:
+the same thing: open a server's sheet — long press its icon in the left rail, or
+tap the server name above the channel list — and **Server Info** is the last
+card in it, under *Permissions* and the rest. Tap it and the panel opens with
+the same items the original shows, each with its own switch:
 
 | Item | |
 | --- | --- |
@@ -197,17 +198,39 @@ show-on-shift was for.
 This is a reimplementation rather than a copy: BetterDiscord plugins run against
 BDFDB and the desktop DOM, and neither exists in this runtime.
 
+### Where the row lands
+
+Current builds draw that sheet as a column of rounded cards — *Mark As Read*,
+*Channels & Roles*, *Permissions* — built from `TableRow` inside
+`TableRowGroup`, with a strip of round buttons across the top. So the row is
+added as another card at the end rather than pushed inside somebody else's card,
+and never into that strip of round buttons, which also looks like a list of
+pressables to anything scanning the tree. An older, flat sheet gets a plain row
+instead; Status says which of the two it did.
+
+The row itself is Discord's own `TableRow` in its own `TableRowGroup`, so it
+matches the cards above it, with `ActionSheetRow` and `FormRow` behind it for
+older builds and a card drawn here if none of them exist.
+
 ### Reaching it without the gesture
 
 **Settings → Servers** lists every server you are in with a one-line summary,
 and opens the same panel for any of them. It reads the stores directly and
 patches nothing, so it works even if the sheet row does not.
 
-The row goes into any sheet whose key mentions a guild, because the exact name
-moves between builds; **Status** reports which key it matched, whether the row
-is Discord's own component or one drawn here (there is the same class error
-boundary as in Toolbox, so a wrong prop on Discord's component cannot take the
-sheet down), and which stores resolved.
+A sheet counts as a server's when a guild is in its props, or when its key
+mentions one — the key's name has moved between builds more than once, and the
+props are the stronger signal either way. Sheets that belong to something else
+(messages, emoji, stickers, profiles) are skipped even when a guild rides along
+in their props. A server sheet that carries nothing identifying falls back to
+the server you have open.
+
+**Status** reports which key it matched, **every** key it has seen opening —
+so if the row never shows up, that list says what this build actually opens and
+the match can be widened to it — whether the row is Discord's own component or
+one drawn here (there is the same class error boundary as in Toolbox, so a wrong
+prop on Discord's component cannot take the sheet down), and which stores
+resolved.
 
 ```js
 __serverdetails.rows(guildId)        // [{label, value}] for the enabled items

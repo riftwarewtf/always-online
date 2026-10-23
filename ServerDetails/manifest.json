@@ -1,7 +1,7 @@
 {
   "name": "ServerDetails",
-  "description": "Long press a server for its details: icon, owner, creation and join dates, members, channels, roles, boosts and language. Every item has its own switch. After DevilBro's BetterDiscord plugin of the same name.",
-  "version": "1.0.0",
+  "description": "Adds a Server Info row to a server's sheet: icon, owner, creation and join dates, members, channels, roles, boosts and language. Every item has its own switch. After DevilBro's BetterDiscord plugin of the same name.",
+  "version": "1.1.0",
   "authors": [
     {
       "name": "Larpbase"
@@ -17,5 +17,5 @@
   "bunny": {
     "icon": "ic_info_24px"
   },
-  "hash": "56dcad174910ef73126c9637e1fd40d593d89be1555ed42773e1aa3be029b761"
+  "hash": "c63e0773c374140adf7a63341128572645f4da0b44aba2504c1370dcf61b51e8"
 }

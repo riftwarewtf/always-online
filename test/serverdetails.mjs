@@ -221,6 +221,24 @@ FormRowComponent.Icon = function Icon() {
 };
 const FormRowModule = { FormRow: FormRowComponent };
 
+// What the server sheet in current builds is actually made of: rows inside
+// rounded group cards - "Mark As Read", "Permissions".
+function TableRow(props) {
+  return React.createElement("View", props);
+}
+TableRow.Icon = function TableRowIcon() {
+  return null;
+};
+function TableRowGroup(props) {
+  return React.createElement("View", props);
+}
+const TableModule = { TableRow, TableRowGroup };
+
+// The round buttons across the top of that sheet: pressable, but not rows.
+function CircleButton(props) {
+  return React.createElement("View", props);
+}
+
 class ErrorBoundary {
   constructor() {
     this.state = {};
@@ -275,7 +293,7 @@ function instead(name, object, callback) {
 
 /* ---- metro ---- */
 
-const propsCandidates = [ActionSheet, FormRowModule, ProfileActions];
+const propsCandidates = [ActionSheet, TableModule, FormRowModule, ProfileActions];
 const storesByName = {
   GuildStore,
   GuildChannelStore,
@@ -335,6 +353,7 @@ assert.equal(pluginStorage.serverId, false, "the extras stay off until asked for
 assert.equal(sd.state().persistent, true, "the injected storage must be the one in use");
 assert.equal(sd.state().panel, "mounted", "the panel host should be mounted");
 assert.equal(sd.state().icon, "resolved", "the row icon should resolve");
+assert.equal(sd.state().row, "TableRow", "and Discord's table row is what the sheet is built from");
 assert.equal(sd.state().servers, 2);
 assert.ok(sd.state().sheet.indexOf("armed") !== -1, "the sheet hook should be armed");
 assert.notEqual(ErrorBoundary.prototype.render, pristineBoundaryRender, "ErrorBoundary should be patched");
@@ -390,50 +409,85 @@ for (const label of ["Server owner", "Creation date", "Members", "Channels", "Ro
 }
 
 /* ------------------------------------------------------------------ *
- * the row in a server's long-press sheet                              *
+ * the row in a server's sheet                                         *
  * ------------------------------------------------------------------ */
 
-const sheetRows = [
-  React.createElement(FormRowComponent, { key: "invite", label: "Invite people", onPress() {} }),
-  React.createElement(FormRowComponent, { key: "mute", label: "Mute server", onPress() {} })
-];
-const sheetModule = { default: () => React.createElement("View", null, sheetRows) };
-const pristineSheetRender = sheetModule.default;
+const row = (label) => React.createElement(TableRow, { label, onPress() {} });
 
-// A sheet that is not about a guild is none of this plugin's business.
+/** Shaped like the real server sheet: a header, round buttons, then cards. */
+function buildServerSheet() {
+  const content = [
+    React.createElement("View", { key: "header" }, "Discord Town Hall"),
+    React.createElement("View", { key: "circles" }, [
+      React.createElement(CircleButton, { key: "b", onPress() {} }),
+      React.createElement(CircleButton, { key: "i", onPress() {} }),
+      React.createElement(CircleButton, { key: "n", onPress() {} })
+    ]),
+    React.createElement(TableRowGroup, { key: "g1" }, [row("Mark As Read"), row("Channels & Roles")]),
+    React.createElement(TableRowGroup, { key: "g2" }, [row("Permissions")])
+  ];
+  return { content, module: { default: () => React.createElement("ScrollView", null, content) } };
+}
+
+/* ---- sheets that are not about a server are left alone ---- */
+
 const messageSheet = { default: () => React.createElement("View", null, []) };
-ActionSheet.openLazy(Promise.resolve(messageSheet), "MessageLongPressActionSheet", { message: {} });
+const pristineMessageSheet = messageSheet.default;
+// A guild rides along in the message sheet's props; it is still not ours.
+ActionSheet.openLazy(Promise.resolve(messageSheet), "MessageLongPressActionSheet", { guild, message: {} });
 await flush();
-assert.equal(messageSheet.default, messageSheet.default, "the message sheet is left alone");
-assert.equal(sd.state().keys.length, 0, "and not recorded");
+assert.equal(messageSheet.default, pristineMessageSheet, "the message sheet belongs to Toolbox, not this");
+assert.equal(sd.state().keys.length, 0, "and is not counted as a server sheet");
+assert.ok(sd.state().seen.includes("MessageLongPressActionSheet"), "but it is still recorded for Status");
 
-ActionSheet.openLazy(Promise.resolve(sheetModule), "GuildLongPressActionSheet", { guild });
+/* ---- the server sheet gets a card at the end ---- */
+
+const sheet = buildServerSheet();
+ActionSheet.openLazy(Promise.resolve(sheet.module), "GuildProfileActionSheet", { guild });
 await flush();
-
-assert.notEqual(sheetModule.default, pristineSheetRender, "the guild sheet component should be patched");
-assert.deepEqual(sd.state().keys, ["GuildLongPressActionSheet"], "and the key recorded for Status");
+assert.deepEqual(sd.state().keys, ["GuildProfileActionSheet"], "the server sheet is matched and recorded");
 
 resetHooks();
-sheetModule.default({ guild });
-assert.equal(sheetModule.default, pristineSheetRender, "the inner patch must remove itself after one render");
-assert.equal(sd.state().strategy, "row list", "the row belongs in the sheet's own row list");
-assert.equal(sheetRows.length, 3, "appended after Discord's own rows");
+sheet.module.default({ guild });
+assert.equal(sd.state().strategy, "card at the end", "a card belongs beside the other cards");
+assert.equal(sheet.content.length, 5, "appended after the last group");
 
-const rowBlock = sheetRows[2];
+const rowBlock = sheet.content[4];
+assert.equal(rowBlock.props.mode, "card");
+
 resetHooks();
 const rendered = rowBlock.type(rowBlock.props);
 assert.equal(rendered.type.displayName, "ServerDetailsGuard", "the native row sits behind a boundary");
 
-const nativeRow = rendered.props.children;
-assert.equal(nativeRow.type, FormRowComponent, "and is Discord's own row component");
-assert.equal(nativeRow.props.label, "Server details");
-assert.equal(nativeRow.props.leading.props.source, 21, "with an icon out of the registry");
+const group = rendered.props.children;
+assert.equal(group.type, TableRowGroup, "wrapped in Discord's group card, so it has a background");
+const nativeRow = group.props.children;
+assert.equal(nativeRow.type, TableRow, "and is Discord's own table row");
+assert.equal(nativeRow.props.label, "Server Info");
+assert.equal(nativeRow.props.icon.props.source, 21, "with an icon out of the registry");
+
+/* ---- an older, flat sheet gets a plain row instead ---- */
+
+const flatRows = [
+  React.createElement(FormRowComponent, { key: "invite", label: "Invite people", onPress() {} }),
+  React.createElement(FormRowComponent, { key: "mute", label: "Mute server", onPress() {} })
+];
+const flatSheet = { default: () => React.createElement("View", null, flatRows) };
+// No guild in the props at all: the open server is used.
+ActionSheet.openLazy(Promise.resolve(flatSheet), "GuildLongPressActionSheet", {});
+await flush();
+resetHooks();
+flatSheet.default({});
+assert.equal(sd.state().strategy, "row list", "a flat sheet takes a plain row");
+assert.equal(flatRows.length, 3, "appended after Discord's own rows");
+assert.equal(flatRows[2].props.mode, "row");
+assert.equal(flatRows[2].props.guildId, guild.id, "falling back to the server that is open");
 
 /* ---- if Discord's component throws, ours is drawn instead ---- */
 
 const GuardClass = rendered.type;
 const guardInstance = new GuardClass(rendered.props);
-assert.equal(guardInstance.render(), rendered.props.children, "a healthy boundary renders the native row");
+assert.equal(guardInstance.render(), rendered.props.children, "a healthy boundary renders the native card");
 guardInstance.componentDidCatch(new Error("bad prop"));
 guardInstance.state = GuardClass.getDerivedStateFromError();
 assert.equal(guardInstance.render(), rendered.props.fallback, "a broken one renders ours");
@@ -441,8 +495,9 @@ assert.equal(sd.state().rowStyle, "drawn (native threw)", "and it is remembered"
 
 resetHooks();
 const drawn = rowBlock.type(rowBlock.props);
-assert.ok(textOf(drawn).includes("Server details"), "the drawn row carries the same label");
+assert.ok(textOf(drawn).includes("Server Info"), "the drawn card carries the same label");
 assert.equal(walk(drawn, (n) => n.type === "Image").props.source, 21, "and the same icon");
+assert.equal(drawn.props.style.borderRadius, 16, "styled as a card, like the ones around it");
 
 /* ---- pressing it opens the panel ---- */
 
@@ -537,7 +592,9 @@ assert.equal(
 resetHooks({ 0: "Status" });
 const statusText = textOf(plugin.settings());
 assert.ok(statusText.includes("persistent"), "storage state is reported");
-assert.ok(statusText.includes("GuildLongPressActionSheet"), "so is the sheet key it matched");
+assert.ok(statusText.includes("GuildProfileActionSheet"), "so is the sheet key it matched");
+assert.ok(statusText.includes("MessageLongPressActionSheet"), "and every key seen, for when it matches none");
+assert.ok(statusText.includes("TableRow"), "and which row component it found");
 assert.ok(!statusText.includes("missing"), "every fake module should have resolved");
 
 /* ------------------------------------------------------------------ *
@@ -549,7 +606,7 @@ assert.equal(ErrorBoundary.prototype.render, pristineBoundaryRender, "ErrorBound
 assert.equal(globalThis.__serverdetails, undefined, "internals bridge removed");
 
 const afterUnload = { default: () => React.createElement("View", null, []) };
-ActionSheet.openLazy(Promise.resolve(afterUnload), "GuildLongPressActionSheet", { guild });
+ActionSheet.openLazy(Promise.resolve(afterUnload), "GuildProfileActionSheet", { guild });
 await flush();
 resetHooks();
 assert.equal(
@@ -561,5 +618,6 @@ assert.equal(
 pendingCleanups.forEach((fn) => fn());
 realLog(
   "all serverdetails smoke tests passed " +
-    `(${clipboardWrites.length} clipboard writes, 9 items verified, native row + fallback, 3 tabs)`
+    `(${clipboardWrites.length} clipboard writes, 9 items verified, card + row injection, ` +
+    "native row + fallback, 3 tabs)"
 );

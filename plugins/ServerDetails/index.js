@@ -276,6 +276,8 @@ function iconFor(spec) {
   return spec.__icon;
 }
 
+var ROW_LABEL = "Server Info";
+
 var ROW_ICON = {
   icons: ["ic_info_24px", "ic_info", "ic_guild_24px"],
   iconMatch: /info|about|detail|guild|server/,
@@ -1098,6 +1100,7 @@ var sheetUnpatch = null;
 var sheetState = "not started";
 var sheetStrategy = "";
 var sheetKeys = [];
+var seenKeys = [];
 var sheetRetryTimer = null;
 var sheetRetries = 0;
 
@@ -1140,13 +1143,27 @@ var Guard = null;
   Guard = Boundary;
 })();
 
-/** Discord's own sheet row, newest shape first. */
-function nativeRow() {
-  return lazy("nativeRow", function () {
+/**
+ * Discord's own row, newest shape first. The server sheet is built out of
+ * TableRow inside TableRowGroup cards - "Mark As Read", "Permissions" - so that
+ * pair is what makes a row look like it belongs there.
+ */
+function rowKit() {
+  return lazy("rowKit", function () {
+    var table = findByProps("TableRow", "TableRowGroup");
+    if (table && table.TableRow) {
+      return { Row: table.TableRow, Group: table.TableRowGroup, iconProp: "icon", name: "TableRow" };
+    }
+    var looseRow = findByProps("TableRow");
+    if (looseRow && looseRow.TableRow) {
+      return { Row: looseRow.TableRow, Group: null, iconProp: "icon", name: "TableRow" };
+    }
     var sheet = findByProps("ActionSheetRow");
-    if (sheet && sheet.ActionSheetRow) return { component: sheet.ActionSheetRow, iconProp: "icon" };
+    if (sheet && sheet.ActionSheetRow) {
+      return { Row: sheet.ActionSheetRow, Group: null, iconProp: "icon", name: "ActionSheetRow" };
+    }
     var form = FormRow();
-    if (form) return { component: form, iconProp: "leading" };
+    if (form) return { Row: form, Group: null, iconProp: "leading", name: "FormRow" };
     return null;
   });
 }
@@ -1156,6 +1173,7 @@ function SheetRow(props) {
     var RN = ReactNative;
     if (!RN || !h) return null;
     var guildId = props.guildId;
+    var card = props.mode === "card";
     var c = useScheme();
     var Touchable = RN.Pressable || RN.TouchableOpacity || RN.View;
     var id = iconFor(ROW_ICON);
@@ -1168,31 +1186,44 @@ function SheetRow(props) {
       }, 80);
     }
 
+    // Ours, shaped like the cards in the sheet it lands in: rounded, filled,
+    // one row tall. Also the fallback if Discord's component throws.
     var drawn = h(
       Touchable,
       {
         onPress: open,
-        style: {
-          minHeight: 48,
-          paddingHorizontal: 16,
-          flexDirection: "row",
-          alignItems: "center"
-        }
+        style: card
+          ? {
+              backgroundColor: c.card,
+              borderRadius: 16,
+              marginHorizontal: 16,
+              marginTop: 16,
+              minHeight: 56,
+              paddingHorizontal: 16,
+              flexDirection: "row",
+              alignItems: "center"
+            }
+          : {
+              minHeight: 48,
+              paddingHorizontal: 16,
+              flexDirection: "row",
+              alignItems: "center"
+            }
       },
       id && RN.Image
         ? h(RN.Image, { source: id, style: { width: 24, height: 24, marginRight: 16, tintColor: c.text } })
         : null,
-      h(RN.Text, { style: { color: c.text, fontSize: 16, fontWeight: "500" } }, "Server details")
+      h(RN.Text, { style: { color: c.text, fontSize: 16, fontWeight: "500" } }, ROW_LABEL)
     );
 
-    var native = storage.nativeRows !== false && !nativeBroken ? nativeRow() : null;
-    if (!native || !Guard) return drawn;
+    var kit = storage.nativeRows !== false && !nativeBroken ? rowKit() : null;
+    if (!kit || !Guard) return drawn;
 
-    var Row = native.component;
-    var rowProps = { label: "Server details", onPress: open };
+    var Row = kit.Row;
+    var rowProps = { label: ROW_LABEL, onPress: open };
     try {
       if (id) {
-        rowProps[native.iconProp] = Row.Icon
+        rowProps[kit.iconProp] = Row.Icon
           ? h(Row.Icon, { source: id })
           : RN.Image
             ? h(RN.Image, { source: id, style: { width: 24, height: 24, tintColor: c.text } })
@@ -1200,7 +1231,12 @@ function SheetRow(props) {
       }
     } catch (e) {}
 
-    return h(Guard, { fallback: drawn }, h(Row, rowProps));
+    var native = h(Row, rowProps);
+    // A card needs the group wrapper, or it floats with no background of its own.
+    if (card && kit.Group) native = h(kit.Group, null, native);
+    else if (card) native = h(RN.View, { style: { marginTop: 16 } }, native);
+
+    return h(Guard, { fallback: drawn }, native);
   } catch (e) {
     log("row render failed", e);
     return null;
@@ -1216,15 +1252,22 @@ function elementName(node) {
 }
 
 /**
- * Finds the array of children holding the sheet's rows, scoring candidates so a
- * stray array of text nodes is never mistaken for the row list. Bounded visit
- * count: this runs inside Discord's render and must never hang it.
+ * Two shapes to land in. The server sheet stacks TableRowGroup cards down a
+ * scroll view, so the right move there is another card at the end - not a row
+ * pushed inside somebody else's card, and certainly not into the strip of round
+ * buttons at the top, which also looks like a list of pressables.
+ *
+ * Older sheets are a flat list of rows, where a plain row is what belongs.
+ *
+ * Bounded visit count: this runs inside Discord's render and must never hang it.
  */
-function findRowContainer(root) {
+function findTarget(root) {
   var queue = [root];
   var seen = [];
-  var best = null;
-  var bestScore = 0;
+  var rowList = null;
+  var rowScore = 0;
+  var cardList = null;
+  var cardScore = 0;
   var visits = 0;
 
   while (queue.length && visits < 3000) {
@@ -1236,21 +1279,31 @@ function findRowContainer(root) {
 
     if (Array.isArray(node)) {
       var elements = 0;
-      var rowish = 0;
+      var rows = 0;
+      var groups = 0;
       for (var i = 0; i < node.length; i++) {
         var child = node[i];
         if (child && typeof child === "object" && (child.type || child.props)) {
           elements++;
-          if (/row|button|item|option/i.test(elementName(child))) rowish++;
-          if (child.props && (child.props.label !== undefined || child.props.onPress !== undefined)) rowish++;
+          var name = elementName(child);
+          if (/group|card|section/i.test(name)) groups++;
+          else if (/tablerow|formrow|actionsheetrow|row$/i.test(name)) rows++;
+          else if (child.props && child.props.label !== undefined) rows++;
         }
         queue.push(child);
       }
-      if (elements) {
-        var score = rowish * 10 + elements;
-        if (score > bestScore && rowish > 0) {
-          bestScore = score;
-          best = node;
+      if (groups) {
+        // The column the cards live in.
+        var gScore = groups * 10 + elements;
+        if (gScore > cardScore) {
+          cardScore = gScore;
+          cardList = node;
+        }
+      } else if (rows) {
+        var rScore = rows * 10 + elements;
+        if (rScore > rowScore) {
+          rowScore = rScore;
+          rowList = node;
         }
       }
       continue;
@@ -1266,16 +1319,20 @@ function findRowContainer(root) {
     if (node.children !== undefined) queue.push(node.children);
   }
 
-  return best;
+  if (cardList) return { list: cardList, mode: "card" };
+  if (rowList) return { list: rowList, mode: "row" };
+  return null;
 }
 
 function injectRow(tree, guildId) {
   if (!h) return undefined;
-  var element = h(SheetRow, { guildId: guildId, key: "serverdetails-row" });
-  var container = findRowContainer(tree);
-  if (container) {
-    container.push(element);
-    sheetStrategy = "row list";
+  var target = findTarget(tree);
+  var mode = target ? target.mode : "card";
+  var element = h(SheetRow, { guildId: guildId, mode: mode, key: "serverdetails-row" });
+
+  if (target) {
+    target.list.push(element);
+    sheetStrategy = mode === "card" ? "card at the end" : "row list";
     sheetState = "row injected";
     return undefined;
   }
@@ -1291,6 +1348,25 @@ function guildIdFromProps(props) {
   if (props.guildId) return props.guildId;
   if (props.guild_id) return props.guild_id;
   if (props.guild && typeof props.guild === "string") return props.guild;
+  if (props.server && props.server.id) return props.server.id;
+  return null;
+}
+
+// Sheets that belong to something else. The message sheet in particular is
+// Toolbox's, and a guild often rides along in its props.
+var NOT_OURS = /message|emoji|reaction|sticker|attachment|media|call|voice|user|profile_?card|member/i;
+
+/**
+ * True for a sheet that is about a server. The key is checked first, then the
+ * props, because the key's name has moved between builds more than once and a
+ * guild sitting in the props is the stronger signal either way.
+ */
+function guildSheetId(key, props) {
+  if (NOT_OURS.test(key)) return null;
+  var fromProps = guildIdFromProps(props);
+  if (fromProps) return fromProps;
+  // A server sheet with nothing in its props: fall back to the open server.
+  if (/guild|server/i.test(key)) return currentGuildId();
   return null;
 }
 
@@ -1326,14 +1402,19 @@ function patchSheet() {
         var promise = args[0];
         var key = args[1];
         var props = args[2];
-        if (!key || typeof key !== "string" || !/guild|server/i.test(key)) return;
+        if (!key || typeof key !== "string") return;
+
+        // Every key is recorded, matched or not: if the row ever fails to show
+        // up, the Status tab is then able to say what this build actually opens.
+        if (seenKeys.indexOf(key) === -1) {
+          seenKeys.push(key);
+          if (seenKeys.length > 12) seenKeys.shift();
+        }
+
         if (!promise || typeof promise.then !== "function") return;
 
-        var guildId = guildIdFromProps(props);
-        if (!guildId) {
-          sheetState = "a guild sheet opened with no guild in its props";
-          return;
-        }
+        var guildId = guildSheetId(key, props);
+        if (!guildId) return;
         if (sheetKeys.indexOf(key) === -1) sheetKeys.push(key);
 
         promise.then(
@@ -1715,7 +1796,7 @@ function SettingsPage() {
       ["UserStore", !!UserStore()],
       ["SelectedGuild", !!SelectedGuildStore()],
       ["ActionSheet", !!ActionSheetModule()],
-      ["Sheet row", !!nativeRow()],
+      ["Row component", rowKit() ? rowKit().name : false],
       ["Asset names", !!assetNames()]
     ];
     var guilds = guildList();
@@ -1733,7 +1814,9 @@ function SettingsPage() {
           sheetState.indexOf("injected") !== -1 ? c.good : c.dim
         ),
         Divider(),
-        InfoRow("Sheets seen", sheetKeys.length ? sheetKeys.join(", ") : "none yet", sheetKeys.length ? c.good : c.dim),
+        InfoRow("Server sheets", sheetKeys.length ? sheetKeys.join(", ") : "none yet", sheetKeys.length ? c.good : c.dim),
+        Divider(),
+        InfoRow("Every sheet seen", seenKeys.length ? seenKeys.join(", ") : "none yet", c.dim),
         Divider(),
         InfoRow(
           "Row style",
@@ -1758,7 +1841,11 @@ function SettingsPage() {
             RN.View,
             { key: "md" + index },
             index ? Divider() : null,
-            InfoRow(pair[0], pair[1] ? "found" : "missing", pair[1] ? c.good : c.error)
+            InfoRow(
+              pair[0],
+              pair[1] === true ? "found" : pair[1] ? pair[1] : "missing",
+              pair[1] ? c.good : c.error
+            )
           );
         })
       ),
@@ -1849,7 +1936,7 @@ function guildName(guildId) {
  * lifecycle                                                          *
  * ------------------------------------------------------------------ */
 
-var VERSION = "1.0.0";
+var VERSION = "1.1.0";
 var running = false;
 
 function syncPatches() {
@@ -1888,6 +1975,8 @@ function start() {
         sheet: sheetState,
         strategy: sheetStrategy,
         keys: sheetKeys.slice(0),
+        seen: seenKeys.slice(0),
+        row: rowKit() ? rowKit().name : "none",
         rowStyle: nativeBroken ? "drawn (native threw)" : storage.nativeRows !== false ? "discord" : "drawn",
         panel: overlayMountState,
         icon: iconFor(ROW_ICON) ? "resolved" : "none",
