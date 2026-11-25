@@ -19,7 +19,9 @@
                       (id, "rocket", aimPoint, pod, podPos)
         HeliDoorFire  (id, [yaw], [true], dir...)          door guns + ground vehicle mounted guns
         EmplacementFire (id, dir...)
-        Gunship2      ("fire", id, gun, aimPoint)
+        Gunship       ("fire", id, gun, aimPoint)
+      Quests
+        QuestAction   ("claim", id) / ("track", id)        auto-claim, auto-track, weapon swap, aim bias
 ]]
 
 local cloneref = cloneref or function(o) return o end
@@ -97,9 +99,17 @@ local Config = {
     EspVehicles = true,
     EspChams = true,
     EspDistance = 1500,
+
+    -- auto quest
+    AutoClaim = true,
+    AutoTrack = true,
+    AutoEquip = false,         -- swap to a weapon your open quests need (never mid-fight)
+    QuestTargeting = false,    -- bend silent aim toward what the focus quest counts (near/far kills)
+    QuestHeads = false,        -- also force Head for headshot quests (feeds the 14-day headshot log)
 }
 
 local State = { alive = true, connections = {} }
+local QuestBias = nil -- { part, minDist, maxDist } from the auto-quest loop
 local function connect(sig, fn)
     local c = sig:Connect(fn)
     table.insert(State.connections, c)
@@ -332,7 +342,7 @@ local function partFor(model, forThrow)
     if forThrow then
         return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
     end
-    if Config.Part == "Head" then
+    if ((QuestBias and QuestBias.part) or Config.Part) == "Head" then
         local head = model:FindFirstChild("Head")
         if head then return head end
     end
@@ -501,6 +511,9 @@ local function pickTarget(camCF, now, ctx)
     local forThrow = ctx == "throw"
     local useVis = Config.VisibleCheck and not forThrow -- lobbing over cover is the point
     local bestE, bestPart, bestVel, bestAngle = nil, nil, Vector3.zero, math.rad(contextFov(ctx))
+    local quest = ctx == "infantry" and QuestBias or nil
+    local minDist = math.max(0.5, quest and quest.minDist or 0)
+    local maxDist = math.min(Config.MaxDistance, quest and quest.maxDist or math.huge)
 
     for _, e in enemies do
         if contextAllows(ctx, e) then
@@ -509,7 +522,7 @@ local function pickTarget(camCF, now, ctx)
             if pos then
                 local offset = pos - camPos
                 local dist = offset.Magnitude
-                if dist > 0.5 and dist <= Config.MaxDistance then
+                if dist > minDist and dist <= maxDist then
                     local angle = angleBetween(offset.Unit, look)
                     if angle < bestAngle and (not useVis or visible(e, pos)) then
                         bestE, bestPart, bestVel, bestAngle = e, part, vel, angle
@@ -1270,6 +1283,239 @@ local function triggerStep(camCF, now, tool)
 end
 
 --------------------------------------------------------------------------------
+-- Auto quest
+--   Progress is counted on the server, so this can't fake kills. It claims rewards the
+--   moment QuestClaim lists them, keeps the closest-to-done quests tracked, swaps to a
+--   weapon your open quests need, and can steer silent aim toward what they count.
+--------------------------------------------------------------------------------
+local QuestData = safeRequire("Game", "QuestData")
+local STUDS_PER_M = QuestData and QuestData.STUDS_PER_M or 2.5
+local TRACK_MAX = QuestData and QuestData.TRACK_MAX or 4
+
+local Quest = { claimAt = {}, actionAt = 0, claimed = 0, summary = "Waiting for quest data...", focus = nil }
+
+local function questRemote()
+    local g = ReplicatedStorage:FindFirstChild("Game")
+    local r = g and g:FindFirstChild("Remotes")
+    return r and r:FindFirstChild("QuestAction")
+end
+
+local function attrList(name)
+    local s = LocalPlayer:GetAttribute(name)
+    if type(s) ~= "string" or s == "" then return {} end
+    return string.split(s, ",")
+end
+
+-- Weapon groups / tool names a quest counts, or nil if any weapon works.
+local function questWants(q)
+    local set = {}
+    if type(q.tool) == "string" then set[q.tool] = true end
+    local only = q.only
+    if only and only.group then
+        if type(only.group) == "string" then
+            set[only.group] = true
+        else
+            for _, g in only.group do set[g] = true end
+        end
+    end
+    local g = type(q.event) == "string" and q.event:match("^kill_(%a+)$")
+    if g then set[g] = true end
+    return next(set) and set or nil
+end
+
+local function toolFits(tool, set)
+    if set[tool.Name] then return true end
+    local group = QuestData and QuestData.GROUP and QuestData.GROUP[tool.Name]
+    return group ~= nil and set[group] == true
+end
+
+local function readQuests()
+    if not (QuestData and QuestData.sections) then return nil end
+    local ok, sections = pcall(QuestData.sections, LocalPlayer)
+    if not ok or type(sections) ~= "table" then return nil end
+
+    local claimable = {}
+    for _, id in attrList("QuestClaim") do claimable[id] = true end
+    local tracked = {}
+    for _, id in attrList("QuestTrack") do tracked[id] = true end
+    local level = LocalPlayer:GetAttribute("Level")
+    if type(level) ~= "number" then level = 1 end
+
+    local list, weekliesDone = {}, 0
+    for _, section in sections do
+        for _, q in section.quests or {} do
+            local p = LocalPlayer:GetAttribute("Quest_" .. q.id)
+            if type(p) ~= "number" then p = q.sample or 0 end
+            local done = p >= q.goal
+            if section.id == "weekly" and done and q.needs == nil then weekliesDone += 1 end
+            list[#list + 1] = {
+                q = q,
+                section = section.id,
+                progress = math.min(p, q.goal),
+                ratio = q.goal > 0 and math.min(p, q.goal) / q.goal or 0,
+                done = done,
+                claimable = claimable[q.id] == true,
+                tracked = tracked[q.id] == true,
+            }
+        end
+    end
+    for _, it in list do
+        local q = it.q
+        it.locked = (q.level ~= nil and level < q.level) or (q.needs ~= nil and weekliesDone < q.needs)
+        it.open = not it.done and not it.locked
+    end
+    return list
+end
+
+local function openByProgress(list)
+    local open = {}
+    for _, it in list do
+        if it.open then open[#open + 1] = it end
+    end
+    table.sort(open, function(a, b)
+        if a.ratio ~= b.ratio then return a.ratio > b.ratio end
+        return a.section == "daily" and b.section ~= "daily"
+    end)
+    return open
+end
+
+local function claimStep(now)
+    local remote = questRemote()
+    if not remote then return end
+    for _, id in attrList("QuestClaim") do
+        local last = Quest.claimAt[id]
+        if not last or now - last > 8 then -- server didn't pay out yet; retry after 8s
+            Quest.claimAt[id] = now
+            Quest.claimed += 1
+            remote:FireServer("claim", id)
+            return -- one per tick so it reads like clicking
+        end
+    end
+end
+
+local function trackStep(open, now)
+    if now < Quest.actionAt then return end
+    local remote = questRemote()
+    if not remote then return end
+
+    local want = {}
+    for i = 1, math.min(TRACK_MAX, #open) do want[open[i].q.id] = true end
+
+    local tracked = attrList("QuestTrack")
+    for _, id in tracked do
+        if not want[id] then
+            Quest.actionAt = now + 1.2
+            remote:FireServer("track", id) -- "track" toggles, so this untracks
+            return
+        end
+    end
+    if #tracked >= TRACK_MAX then return end
+    for i = 1, math.min(TRACK_MAX, #open) do
+        local it = open[i]
+        if not table.find(tracked, it.q.id) then
+            Quest.actionAt = now + 1.2
+            remote:FireServer("track", it.q.id)
+            return
+        end
+    end
+end
+
+local function equipStep(open, now)
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 or myVehicle(now) or Current.entry then return end
+
+    local sets = {}
+    for _, it in open do
+        local s = questWants(it.q)
+        if s then sets[#sets + 1] = s end
+    end
+    if #sets == 0 then return end
+
+    local held = currentTool()
+    if held then
+        for _, s in sets do
+            if toolFits(held, s) then return end
+        end
+    end
+
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    if not backpack then return end
+    for _, s in sets do -- sets are in progress order, so the closest quest wins
+        for _, t in backpack:GetChildren() do
+            if t:IsA("Tool") and toolFits(t, s) then
+                hum:EquipTool(t)
+                return
+            end
+        end
+    end
+end
+
+local function biasFrom(open)
+    for _, it in open do
+        local q, only = it.q, it.q.only or {}
+        local wantsHead = q.event == "headshots" or only.head or (q.x2 and q.x2.head)
+        if only.near or only.far or (wantsHead and Config.QuestHeads) then
+            Quest.focus = it
+            return {
+                part = (wantsHead and Config.QuestHeads) and "Head" or nil,
+                minDist = only.far and (only.far * STUDS_PER_M + 2) or nil,
+                maxDist = only.near and (only.near * STUDS_PER_M - 1) or nil,
+            }
+        end
+    end
+    return nil
+end
+
+local function summarize(list, open)
+    local counts = { daily = { 0, 0 }, weekly = { 0, 0 } }
+    for _, it in list do
+        local c = counts[it.section]
+        if c then
+            c[2] += 1
+            if it.done then c[1] += 1 end
+        end
+    end
+    local lines = {
+        ("Daily %d/%d   Weekly %d/%d   Claims sent %d"):format(
+            counts.daily[1], counts.daily[2], counts.weekly[1], counts.weekly[2], Quest.claimed),
+    }
+    for i = 1, math.min(4, #open) do
+        local it = open[i]
+        lines[#lines + 1] = ("%s  %d/%d"):format(it.q.name, it.progress, it.q.goal)
+    end
+    if QuestBias and Quest.focus then
+        lines[#lines + 1] = "Aim bent for: " .. Quest.focus.q.name
+    end
+    return table.concat(lines, "\n")
+end
+
+task.spawn(function()
+    while State.alive do
+        local now = os.clock()
+        if Config.AutoClaim then pcall(claimStep, now) end
+
+        local ok, list = pcall(readQuests)
+        if ok and list then
+            local open = openByProgress(list)
+            Quest.focus = nil
+            QuestBias = Config.QuestTargeting and biasFrom(open) or nil
+            if Config.AutoTrack then pcall(trackStep, open, now) end
+            if Config.AutoEquip then pcall(equipStep, open, now) end
+            Quest.summary = summarize(list, open)
+        else
+            QuestBias = nil
+            Quest.summary = QuestData and "Quest data not ready yet"
+                or "QuestData didn't load on this executor. Auto-claim still works, tracking/equip/aim bias don't."
+        end
+        if Quest.panel then
+            pcall(function() Quest.panel:SetDesc(Quest.summary) end)
+        end
+        task.wait(0.5)
+    end
+end)
+
+--------------------------------------------------------------------------------
 -- Frame loop
 --------------------------------------------------------------------------------
 connect(RunService.RenderStepped, function()
@@ -1439,6 +1685,32 @@ VisTab:Section({ Title = "Recoil" })
 toggle(VisTab, "No Recoil", "NoRecoil",
     GunRecoil and "Scales camera kick from every gun" or "GunRecoil didn't load on this executor")
 slider(VisTab, "Recoil Kept (%)", "RecoilScale", 0, 100)
+
+-- Quests
+local QuestTab = Window:Tab({ Title = "Quests", Icon = "scroll-text" })
+Quest.panel = QuestTab:Paragraph({ Title = "Progress", Desc = Quest.summary })
+toggle(QuestTab, "Auto Claim", "AutoClaim", "Claims XP + scrap the moment a quest finishes")
+toggle(QuestTab, "Auto Track", "AutoTrack", "Keeps the " .. TRACK_MAX .. " closest-to-done quests on your HUD")
+toggle(QuestTab, "Auto Equip Quest Weapon", "AutoEquip",
+    "Switches to a backpack weapon your open quests count. Never while silent aim has a target")
+toggle(QuestTab, "Quest Targeting", "QuestTargeting",
+    "Silent aim only picks targets the focus quest counts: under 15m for close kills, past 40/75m for far ones")
+toggle(QuestTab, "Headshot Quests Force Head", "QuestHeads",
+    "Overrides Hit Part on headshot quests. Feeds their 14-day headshot log, leave off on mains")
+QuestTab:Button({
+    Title = "Claim Everything Now",
+    Callback = function()
+        table.clear(Quest.claimAt)
+        local remote = questRemote()
+        if not remote then return end
+        for _, id in attrList("QuestClaim") do
+            Quest.claimAt[id] = os.clock()
+            Quest.claimed += 1
+            remote:FireServer("claim", id)
+            task.wait(0.3)
+        end
+    end,
+})
 
 -- Settings
 local SetTab = Window:Tab({ Title = "Settings", Icon = "settings" })
